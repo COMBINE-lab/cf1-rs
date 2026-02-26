@@ -18,7 +18,7 @@ paraseq = "0.4.8"
 ph = { version = "0.11", features = ["wyhash"] }
 simd-minimizers = "2.3"
 voracious_radix_sort = "1"
-tracing = "0.1"
+tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

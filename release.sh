@@ -35,9 +35,11 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-# Ensure working tree is clean.
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "Error: working tree is not clean. Commit or stash changes first."
+# Ensure working tree is clean (ignoring Cargo.toml/Cargo.lock which this script modifies).
+if [ -n "$(git diff --name-only -- ':!Cargo.toml' ':!Cargo.lock')" ] || \
+   [ -n "$(git diff --cached --name-only -- ':!Cargo.toml' ':!Cargo.lock')" ]; then
+    echo "Error: working tree has uncommitted changes outside Cargo.toml/Cargo.lock."
+    echo "Commit or stash changes first."
     exit 1
 fi
 
