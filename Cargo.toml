@@ -1,0 +1,30 @@
+[package]
+name = "cf1-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["Rob Patro <rob@cs.umd.edu>"]
+description = "Fast construction of compacted reference de Bruijn graphs"
+license = "BSD-3-Clause"
+repository = "https://github.com/COMBINE-lab/cf1-rs"
+homepage = "https://github.com/COMBINE-lab/cf1-rs"
+keywords = ["bioinformatics", "de-bruijn-graph", "genomics", "k-mer"]
+categories = ["command-line-utilities", "science"]
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+paraseq = { git = "https://github.com/noamteyssier/paraseq" }
+ph = { version = "0.11", features = ["wyhash"] }
+simd-minimizers = { git = "https://github.com/rust-seq/simd-minimizers" }
+voracious_radix_sort = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
+nohash-hasher = "0.2"
+anyhow = "1"
+ahash = "0.8"
+itoa = "1"
