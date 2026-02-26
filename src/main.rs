@@ -72,5 +72,6 @@ where
     cf1_rs::kmer::Kmer<K>: cf1_rs::kmer::KmerBits,
     <cf1_rs::kmer::Kmer<K> as cf1_rs::kmer::KmerBits>::Storage: cf1_rs::mphf::RadixSortDedup,
 {
-    run_pipeline::<K>(params)
+    let _ = run_pipeline::<K>(params)?;
+    Ok(())
 }

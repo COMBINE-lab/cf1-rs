@@ -27,4 +27,5 @@ flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
 nohash-hasher = "0.2"
 anyhow = "1"
 ahash = "0.8"
+bon = "3"
 itoa = "1"

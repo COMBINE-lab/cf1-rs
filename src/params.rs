@@ -98,8 +98,6 @@ impl Params {
         num_bins: usize,
         memory_budget_gb: f64,
     ) -> anyhow::Result<Self> {
-        assert!(k % 2 == 1 && k >= 1 && k <= 63, "k must be odd and in [1, 63]");
-
         let mut input_files = Vec::new();
 
         if let Some(s) = seq_file {
@@ -132,7 +130,43 @@ impl Params {
             }
         }
 
-        assert!(!input_files.is_empty(), "No input files specified");
+        anyhow::ensure!(!input_files.is_empty(), "No input files specified");
+
+        Self::from_resolved(
+            input_files,
+            k,
+            threads,
+            output,
+            format,
+            work_dir,
+            track_short_seqs,
+            poly_n_stretch,
+            collate_in_mem,
+            num_bins,
+            memory_budget_gb,
+        )
+    }
+
+    /// Build `Params` from already-resolved input file paths.
+    /// Used by both the CLI (`from_build_args`) and the library API (`cf_build`).
+    pub fn from_resolved(
+        input_files: Vec<PathBuf>,
+        k: usize,
+        threads: usize,
+        output: PathBuf,
+        format: u8,
+        work_dir: Option<PathBuf>,
+        track_short_seqs: bool,
+        poly_n_stretch: bool,
+        collate_in_mem: bool,
+        num_bins: usize,
+        memory_budget_gb: f64,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            k % 2 == 1 && k >= 1 && k <= 63,
+            "k must be odd and in [1, 63], got {k}"
+        );
+        anyhow::ensure!(!input_files.is_empty(), "No input files specified");
 
         let work_dir = work_dir.unwrap_or_else(|| {
             output

@@ -8,7 +8,7 @@ use crate::state_vector::AtomicStateVector;
 use crate::superkmer::{cleanup_bin_files, route_superkmers};
 use tracing::info;
 
-pub fn run_pipeline<const K: usize>(params: &Params) -> anyhow::Result<()>
+pub fn run_pipeline<const K: usize>(params: &Params) -> anyhow::Result<(crate::output::UnipathsMeta, Vec<(String, usize)>)>
 where
     Kmer<K>: KmerBits,
     <Kmer<K> as KmerBits>::Storage: crate::mphf::RadixSortDedup,
@@ -43,5 +43,5 @@ where
     write_json(params, &meta, &short_seqs)?;
 
     info!("Pipeline complete.");
-    Ok(())
+    Ok((meta, short_seqs))
 }
