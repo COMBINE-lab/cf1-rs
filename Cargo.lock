@@ -1247,7 +1247,8 @@ dependencies = [
 [[package]]
 name = "paraseq"
 version = "0.4.8"
-source = "git+https://github.com/noamteyssier/paraseq#3d3bdae6eda3fad7ccce02bbeb02e2cd4de0c2df"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac8bd9a3e86bdab599f10d07e7d7531b7363e1d50b502856c0fb0b3efc532e65"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1724,7 +1725,8 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 [[package]]
 name = "simd-minimizers"
 version = "2.3.0"
-source = "git+https://github.com/rust-seq/simd-minimizers#cfbf07610c2a45e3e1b274c1b2d135134c03da03"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d337c81bca2fc990b480ed2fe3421c66227e4ca427a9b9d7cfcfe97e9b4f986"
 dependencies = [
  "clap",
  "itertools 0.14.0",

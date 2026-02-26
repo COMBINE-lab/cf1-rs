@@ -14,9 +14,9 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
-paraseq = { git = "https://github.com/noamteyssier/paraseq" }
+paraseq = "0.4"
 ph = { version = "0.11", features = ["wyhash"] }
-simd-minimizers = { git = "https://github.com/rust-seq/simd-minimizers" }
+simd-minimizers = "2.3"
 voracious_radix_sort = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
