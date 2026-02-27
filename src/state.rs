@@ -136,7 +136,7 @@ impl State {
 
     /// Is this state outputted?
     pub fn is_outputted(self) -> bool {
-        matches!(self.0, 12 | 13 | 14 | 15)
+        matches!(self.0, 12..=15)
     }
 
     /// Return the outputted version of this state.

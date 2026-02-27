@@ -15,7 +15,7 @@ impl AtomicStateVector {
     const STATE_MASK: u64 = 0x1F;
 
     pub fn new(len: usize) -> Self {
-        let num_words = (len + Self::STATES_PER_WORD - 1) / Self::STATES_PER_WORD;
+        let num_words = len.div_ceil(Self::STATES_PER_WORD);
         let mut data = Vec::with_capacity(num_words);
         for _ in 0..num_words {
             data.push(AtomicU64::new(0));
@@ -25,6 +25,10 @@ impl AtomicStateVector {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Get the state at index i.

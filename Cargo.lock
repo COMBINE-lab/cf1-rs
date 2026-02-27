@@ -132,18 +132,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "bgzip"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b64fd8980fb64af5951bc05de7772b598150a6f7eac42ec17f73e8489915f99b"
-dependencies = [
- "flate2",
- "log",
- "rayon",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "binout"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,10 +194,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffer-redux"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "431a9cc8d7efa49bc326729264537f5e60affce816c66edf434350778c9f4f54"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+
+[[package]]
+name = "bytecount"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
 name = "bytemuck"
@@ -231,11 +234,12 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "bzip2"
-version = "0.5.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
+checksum = "bdb116a6ef3f6c3698828873ad02c3014b3c85cadb88496095628e3ef1e347f8"
 dependencies = [
  "bzip2-sys",
+ "libc",
 ]
 
 [[package]]
@@ -274,10 +278,11 @@ dependencies = [
  "anyhow",
  "bon",
  "clap",
- "flate2",
+ "crossbeam-channel",
  "itoa",
+ "libc",
+ "needletail",
  "nohash-hasher",
- "paraseq",
  "ph",
  "rayon",
  "serde",
@@ -697,7 +702,6 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
- "zlib-rs",
 ]
 
 [[package]]
@@ -1002,15 +1006,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "lock_api"
-version = "0.4.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
-dependencies = [
- "scopeguard",
-]
-
-[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1105,17 +1100,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "729eb334247daa1803e0a094d0a5c55711b85571179f5ec6e53eccfdf7008958"
 
 [[package]]
-name = "niffler"
-version = "3.0.0"
+name = "needletail"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62d3115cc93dac9fabdfd25f7d4fda51ad4a959fb4667d39af20f70bddfb3574"
+checksum = "6aa22e1ae8bce4ecf257e2475ef2046026caea08d66b1848d073fe7bc77e4351"
 dependencies = [
- "bgzip",
+ "buffer-redux",
+ "bytecount",
  "bzip2",
- "cfg-if",
  "flate2",
  "liblzma",
- "thiserror 2.0.18",
+ "memchr",
  "zstd",
 ]
 
@@ -1185,16 +1180,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
-]
-
-[[package]]
 name = "objc2-core-foundation"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1242,49 +1227,6 @@ dependencies = [
  "mem_dbg",
  "rand",
  "wide",
-]
-
-[[package]]
-name = "paraseq"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac8bd9a3e86bdab599f10d07e7d7531b7363e1d50b502856c0fb0b3efc532e65"
-dependencies = [
- "anyhow",
- "crossbeam-channel",
- "either",
- "env_logger",
- "itertools 0.14.0",
- "log",
- "memchr",
- "niffler",
- "num_cpus",
- "parking_lot",
- "smallvec",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "parking_lot"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
-dependencies = [
- "lock_api",
- "parking_lot_core",
-]
-
-[[package]]
-name = "parking_lot_core"
-version = "0.9.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
-dependencies = [
- "cfg-if",
- "libc",
- "redox_syscall",
- "smallvec",
- "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -1542,15 +1484,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redox_syscall"
-version = "0.5.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
-dependencies = [
- "bitflags 2.11.0",
-]
-
-[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1615,12 +1548,6 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
-
-[[package]]
-name = "scopeguard"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sealed"
@@ -2636,12 +2563,6 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
-
-[[package]]
-name = "zlib-rs"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c745c48e1007337ed136dc99df34128b9faa6ed542d80a1c673cf55a6d7236c8"
 
 [[package]]
 name = "zmij"

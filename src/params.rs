@@ -83,6 +83,7 @@ pub struct Params {
 }
 
 impl Params {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_build_args(
         seq_file: Option<PathBuf>,
         list_file: Option<PathBuf>,
@@ -149,6 +150,7 @@ impl Params {
 
     /// Build `Params` from already-resolved input file paths.
     /// Used by both the CLI (`from_build_args`) and the library API (`cf_build`).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_resolved(
         input_files: Vec<PathBuf>,
         k: usize,
@@ -163,7 +165,7 @@ impl Params {
         memory_budget_gb: f64,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            k % 2 == 1 && k >= 1 && k <= 63,
+            k % 2 == 1 && (1..=63).contains(&k),
             "k must be odd and in [1, 63], got {k}"
         );
         anyhow::ensure!(!input_files.is_empty(), "No input files specified");
@@ -218,7 +220,7 @@ impl Params {
     /// Minimizer length: min(k/2 - 1, 15), always odd.
     pub fn minimizer_len(&self) -> usize {
         let m = std::cmp::min(self.k / 2, 15);
-        if m % 2 == 0 {
+        if m.is_multiple_of(2) {
             m.saturating_sub(1).max(1)
         } else {
             m

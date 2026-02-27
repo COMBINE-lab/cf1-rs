@@ -18,7 +18,7 @@ impl Base {
     pub fn from_ascii(b: u8) -> Option<Base> {
         let mapped = MAPPED_BASE[b as usize];
         if mapped <= 3 {
-            Some(unsafe { std::mem::transmute(mapped) })
+            Some(unsafe { std::mem::transmute::<u8, Base>(mapped) })
         } else {
             None
         }

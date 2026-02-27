@@ -1,3 +1,4 @@
+use crate::budget::InFlightBudget;
 use crate::directed_kmer::DirectedKmer;
 use crate::dna::{is_placeholder, Base};
 use crate::kmer::{Kmer, KmerBits};
@@ -6,6 +7,10 @@ use crate::state::{State, StateClass, Vertex};
 use crate::state_vector::AtomicStateVector;
 use crate::directed_kmer::FWD;
 use std::sync::Mutex;
+
+/// Target chunk size (k-mer positions) for splitting large sequences.
+/// Keeps per-thread working set small for better allocator page reuse.
+const CHUNK_KMERS: usize = 4_000_000;
 
 /// Classifier: performs Phase 4 DFA classification.
 /// Exact port of CdBG_Builder.cpp.
@@ -514,11 +519,13 @@ where
 }
 
 /// Classify all vertices from input sequences.
-/// Uses rayon to process sequences in parallel.
+/// Uses adaptive parallelism: small sequences are individual tasks,
+/// large sequences are processed synchronously with borrowed data.
 pub fn classify_vertices<const K: usize>(
     params: &crate::params::Params,
     mphf: &Mphf<K>,
     states: &AtomicStateVector,
+    budget: &InFlightBudget,
 ) -> anyhow::Result<Vec<(String, usize)>>
 where
     Kmer<K>: KmerBits,
@@ -530,40 +537,59 @@ where
     let classifier = Classifier::<K>::new(mphf, states);
     let short_seqs = Mutex::new(Vec::new());
 
-    // Use rayon::in_place_scope + spawn for work-stealing scheduling.
-    // Each sequence is spawned independently, so when a thread finishes a small
-    // chromosome it immediately picks up the next available one.
     rayon::in_place_scope(|s| {
         for input_file in &params.input_files {
-            let reader = crate::minimizer::open_fasta(input_file).unwrap();
-            let mut fasta_reader = paraseq::fasta::Reader::new(reader);
-            let mut record_set = fasta_reader.new_record_set();
+            let mut reader = needletail::parse_fastx_file(input_file)
+                .expect("failed to open FASTA file");
 
-            while record_set.fill(&mut fasta_reader).unwrap() {
-                for record_result in record_set.iter() {
-                    let record = record_result.unwrap();
-                    let seq = record.seq();
-                    let seq_len = seq.len();
+            while let Some(result) = reader.next() {
+                let record = result.expect("invalid FASTA record");
+                let seq = record.seq();
+                let seq_len = seq.len();
 
-                    if seq_len < K {
-                        if params.track_short_seqs {
-                            let name = std::str::from_utf8(record.id())
-                                .unwrap_or("")
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or("")
-                                .to_string();
-                            short_seqs.lock().unwrap().push((name, seq_len));
-                        }
-                        continue;
+                if seq_len < K {
+                    if params.track_short_seqs {
+                        let name = std::str::from_utf8(record.id())
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        short_seqs.lock().unwrap().push((name, seq_len));
                     }
+                    continue;
+                }
 
+                let right_end = seq_len - K;
+
+                if seq_len < CHUNK_KMERS {
+                    // Small sequence: copy and spawn async for between-sequence parallelism.
+                    budget.wait_and_acquire(seq_len);
                     let seq_owned = seq.to_vec();
                     let classifier = &classifier;
+                    let budget = &budget;
 
                     s.spawn(move |_| {
-                        let right_end = seq_len - K;
                         classifier.process_substring(&seq_owned, seq_len, 0, right_end);
+                        budget.release(seq_len);
+                    });
+                } else {
+                    // Large sequence: process synchronously with borrowed data (zero copy).
+                    // Use fixed-size chunks for better allocator page reuse.
+                    // process_substring uses the full seq buffer for boundary checks,
+                    // so chunks get correct neighbor classification without overlap.
+                    let seq_ref: &[u8] = &seq;
+                    rayon::scope(|inner| {
+                        let mut left = 0;
+                        while left <= right_end {
+                            let right = (left + CHUNK_KMERS - 1).min(right_end);
+                            let classifier = &classifier;
+
+                            inner.spawn(move |_| {
+                                classifier.process_substring(seq_ref, seq_len, left, right);
+                            });
+                            left += CHUNK_KMERS;
+                        }
                     });
                 }
             }

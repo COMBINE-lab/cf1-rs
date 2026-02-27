@@ -1,5 +1,6 @@
+use crate::budget::InFlightBudget;
 use crate::dna::{is_placeholder, Base};
-use crate::minimizer::{open_fasta, Partitioning};
+use crate::minimizer::Partitioning;
 use crate::params::Params;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -9,10 +10,19 @@ use tracing::info;
 /// Flush threshold for per-thread bin buffers (bytes).
 const FLUSH_THRESHOLD: usize = 64 * 1024;
 
+/// Target chunk size (bases) for splitting large sequences across threads.
+/// Keeps simd_minimizers internal allocations small enough for the system
+/// allocator to efficiently reuse freed pages between chromosomes.
+const CHUNK_BASES: usize = 4_000_000;
+
 /// Write super k-mers to per-bin temp files in 2-bit packed format.
 /// Uses rayon::in_place_scope + spawn for parallel processing of sequences,
 /// with per-thread bin buffers that flush to shared writers when full.
-pub fn route_superkmers(params: &Params, partitioning: &Partitioning) -> anyhow::Result<()> {
+pub fn route_superkmers(
+    params: &Params,
+    partitioning: &Partitioning,
+    budget: &InFlightBudget,
+) -> anyhow::Result<()> {
     let m = params.minimizer_len();
     let k = params.k;
     let w = k - m + 1;
@@ -33,73 +43,47 @@ pub fn route_superkmers(params: &Params, partitioning: &Partitioning) -> anyhow:
 
     rayon::in_place_scope(|s| {
         for input_file in &params.input_files {
-            let reader = open_fasta(input_file).unwrap();
-            let mut fasta_reader = paraseq::fasta::Reader::new(reader);
-            let mut record_set = fasta_reader.new_record_set();
+            let mut reader = needletail::parse_fastx_file(input_file)
+                .expect("failed to open FASTA file");
 
-            while record_set.fill(&mut fasta_reader).unwrap() {
-                for record_result in record_set.iter() {
-                    let record = record_result.unwrap();
-                    let seq = record.seq();
-                    if seq.len() < k {
-                        continue;
-                    }
+            while let Some(result) = reader.next() {
+                let record = result.expect("invalid FASTA record");
+                let seq = record.seq();
+                let seq_len = seq.len();
+                if seq_len < k {
+                    continue;
+                }
 
+                if seq_len < CHUNK_BASES {
+                    // Small sequence: copy and spawn async for between-sequence parallelism.
+                    budget.wait_and_acquire(seq_len);
                     let seq_owned = seq.to_vec();
                     let partitioning = &partitioning;
                     let writers = &writers;
+                    let budget = &budget;
 
                     s.spawn(move |_| {
-                        let mut positions: Vec<u32> = Vec::new();
-                        let mut skmer_positions: Vec<u32> = Vec::new();
-                        let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); num_bins];
-                        let mut pack_buf: Vec<u8> = Vec::new();
+                        route_chunk(&seq_owned, m, w, k, num_bins, partitioning, writers);
+                        budget.release(seq_len);
+                    });
+                } else {
+                    // Large sequence: process synchronously with borrowed data (zero copy).
+                    // Use fixed-size chunks so simd_minimizers internal allocations stay
+                    // small enough for the system allocator to reuse freed pages.
+                    let overlap = k - 1;
+                    rayon::scope(|inner| {
+                        let mut start = 0;
+                        while start < seq_len {
+                            let end = (start + CHUNK_BASES + overlap).min(seq_len);
+                            let chunk = &seq[start..end];
+                            let partitioning = &partitioning;
+                            let writers = &writers;
 
-                        let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(&seq_owned);
-                        let output = simd_minimizers::canonical_minimizers(m, w)
-                            .super_kmers(&mut skmer_positions)
-                            .run(ascii_seq, &mut positions);
-
-                        let pos_vals: Vec<(u32, u64)> = output.pos_and_values_u64().collect();
-                        let num_skmers = pos_vals.len();
-
-                        for sk_idx in 0..num_skmers {
-                            let start_kmer_pos = skmer_positions[sk_idx] as usize;
-                            let end_kmer_pos = if sk_idx + 1 < num_skmers {
-                                skmer_positions[sk_idx + 1] as usize
-                            } else {
-                                seq_owned.len() - k + 1
-                            };
-
-                            if end_kmer_pos <= start_kmer_pos {
-                                continue;
-                            }
-
-                            let seq_start = start_kmer_pos;
-                            let seq_end = end_kmer_pos - 1 + k;
-
-                            if seq_end > seq_owned.len() {
-                                continue;
-                            }
-
-                            let subseq = &seq_owned[seq_start..seq_end];
-                            let hash = pos_vals[sk_idx].1;
-                            let bin = partitioning.bin_for_minimizer(hash);
-
-                            // Split super k-mer at placeholder (N) positions.
-                            // Only write N-free segments >= k bases.
-                            write_packed_segments(
-                                subseq,
-                                k,
-                                bin,
-                                &mut buffers,
-                                writers,
-                                &mut pack_buf,
-                            );
+                            inner.spawn(move |_| {
+                                route_chunk(chunk, m, w, k, num_bins, partitioning, writers);
+                            });
+                            start += CHUNK_BASES;
                         }
-
-                        // Flush remaining buffers.
-                        flush_all_buffers(&mut buffers, writers);
                     });
                 }
             }
@@ -110,9 +94,62 @@ pub fn route_superkmers(params: &Params, partitioning: &Partitioning) -> anyhow:
     for writer in &writers {
         writer.lock().unwrap().flush().unwrap();
     }
+    drop(writers);
 
     info!("Finished routing super k-mers to bin files");
     Ok(())
+}
+
+/// Route super k-mers from a sequence chunk to bin files.
+fn route_chunk(
+    seq: &[u8],
+    m: usize,
+    w: usize,
+    k: usize,
+    num_bins: usize,
+    partitioning: &Partitioning,
+    writers: &[Mutex<BinWriter>],
+) {
+    let mut positions: Vec<u32> = Vec::new();
+    let mut skmer_positions: Vec<u32> = Vec::new();
+    let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); num_bins];
+    let mut pack_buf: Vec<u8> = Vec::new();
+
+    let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seq);
+    let output = simd_minimizers::canonical_minimizers(m, w)
+        .super_kmers(&mut skmer_positions)
+        .run(ascii_seq, &mut positions);
+
+    let pos_vals: Vec<(u32, u64)> = output.pos_and_values_u64().collect();
+    let num_skmers = pos_vals.len();
+
+    for sk_idx in 0..num_skmers {
+        let start_kmer_pos = skmer_positions[sk_idx] as usize;
+        let end_kmer_pos = if sk_idx + 1 < num_skmers {
+            skmer_positions[sk_idx + 1] as usize
+        } else {
+            seq.len() - k + 1
+        };
+
+        if end_kmer_pos <= start_kmer_pos {
+            continue;
+        }
+
+        let seq_start = start_kmer_pos;
+        let seq_end = end_kmer_pos - 1 + k;
+
+        if seq_end > seq.len() {
+            continue;
+        }
+
+        let subseq = &seq[seq_start..seq_end];
+        let hash = pos_vals[sk_idx].1;
+        let bin = partitioning.bin_for_minimizer(hash);
+
+        write_packed_segments(subseq, k, bin, &mut buffers, writers, &mut pack_buf);
+    }
+
+    flush_all_buffers(&mut buffers, writers);
 }
 
 /// Split a super k-mer at N positions and write N-free segments as packed 2-bit.
@@ -149,7 +186,7 @@ fn pack_and_buffer(
     pack_buf: &mut Vec<u8>,
 ) {
     let base_len = ascii.len() as u16;
-    let packed_bytes = (ascii.len() + 3) / 4;
+    let packed_bytes = ascii.len().div_ceil(4);
 
     // Pack into reusable buffer.
     pack_buf.clear();
@@ -244,7 +281,7 @@ impl BinReader {
             Err(e) => return Err(e.into()),
         }
         let base_count = u16::from_le_bytes(len_buf) as usize;
-        let packed_bytes = (base_count + 3) / 4;
+        let packed_bytes = base_count.div_ceil(4);
         self.buf.resize(packed_bytes, 0);
         self.reader.read_exact(&mut self.buf)?;
         Ok(Some((base_count, &self.buf)))

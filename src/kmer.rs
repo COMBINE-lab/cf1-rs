@@ -101,9 +101,9 @@ impl<const K: usize> Kmer<K>
 where
     Kmer<K>: KmerBits,
 {
-    const NUM_WORDS: usize = (K + 31) / 32;
+    const NUM_WORDS: usize = K.div_ceil(32);
     const CLEAR_MSN_MASK: u64 = !(0b11u64 << (2 * ((K - 1) % 32)));
-    const NUM_BYTES: usize = (K + 3) / 4;
+    const NUM_BYTES: usize = K.div_ceil(4);
     const MSN_SHIFT: usize = 2 * ((K - 1) % 32);
 
     /// Create a k-mer from ASCII sequence at the given offset.
@@ -137,7 +137,7 @@ where
         let byte_start = base_offset / 4;
         let sub_offset = base_offset % 4;
         let total_bases = sub_offset + K;
-        let bytes_needed = (total_bases + 3) / 4;
+        let bytes_needed = total_bases.div_ceil(4);
 
         // Read bytes into u128 accumulator (handles up to 64 bases = K≤61 with sub_offset≤3).
         let mut val = 0u128;
@@ -375,30 +375,16 @@ impl Base {
 }
 
 /// Encode a fixed-size word from ASCII DNA characters.
+/// First character occupies the most-significant bits, matching C++ cuttlefish.
 fn encode_word<const N: usize>(label: &[u8]) -> u64 {
     debug_assert!(label.len() >= N);
-    let mut val = 0u64;
-    for i in 0..N {
-        val = (Base::map_base(label[i]) as u64) << (2 * (N - 1 - i)) | val;
-        // Actually the C++ does: (map_base(label[0]) << (2*(B-1))) | encode<B-1>(label+1)
-        // Which means: first char gets highest bits.
-    }
-    // Re-implement to exactly match C++ recursive pattern.
-    let mut val2 = 0u64;
-    for i in 0..N {
-        val2 = (val2 << 2) | (Base::map_base(label[i]) as u64);
-    }
-    val2
+    label.iter().take(N).fold(0u64, |acc, &b| (acc << 2) | (Base::map_base(b) as u64))
 }
 
 /// Encode a variable-size word.
 fn encode_word_dyn(n: usize, label: &[u8]) -> u64 {
     debug_assert!(label.len() >= n);
-    let mut val = 0u64;
-    for i in 0..n {
-        val = (val << 2) | (Base::map_base(label[i]) as u64);
-    }
-    val
+    label.iter().take(n).fold(0u64, |acc, &b| (acc << 2) | (Base::map_base(b) as u64))
 }
 
 // Implementation for K=1..=32 (single u64 storage).

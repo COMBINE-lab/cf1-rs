@@ -14,7 +14,7 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
 rayon = "1.11"
-paraseq = "0.4.8"
+needletail = "0.6"
 ph = { version = "0.11", features = ["wyhash"] }
 simd-minimizers = "2.3"
 voracious_radix_sort = "1"
@@ -23,9 +23,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-flate2 = { version = "1.1.9", features = ["zlib-rs"], default-features = false }
 nohash-hasher = "0.2"
 anyhow = "1.0.102"
 ahash = "0.8.12"
 bon = "3.9.0"
 itoa = "1.0.17"
+libc = "0.2"
+crossbeam-channel = "0.5.15"

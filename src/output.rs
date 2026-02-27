@@ -1,3 +1,4 @@
+use crate::budget::InFlightBudget;
 use crate::directed_kmer::{AnnotatedKmer, Direction, FWD};
 use crate::dna::{complement_char, is_placeholder, to_upper};
 use crate::kmer::{Kmer, KmerBits};
@@ -35,6 +36,12 @@ pub struct UnipathsMeta {
     pub max_len: usize,
     pub min_len: usize,
     pub sum_len: u64,
+}
+
+impl Default for UnipathsMeta {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UnipathsMeta {
@@ -145,6 +152,7 @@ pub fn extract_and_output<const K: usize>(
     params: &Params,
     mphf: &Mphf<K>,
     states: &AtomicStateVector,
+    budget: &InFlightBudget,
 ) -> anyhow::Result<UnipathsMeta>
 where
     Kmer<K>: KmerBits,
@@ -163,38 +171,96 @@ where
 
     let global_meta = Mutex::new(UnipathsMeta::new());
 
-    // Use rayon::in_place_scope for work-stealing: each sequence is spawned
-    // independently, so when a thread finishes a small chromosome it immediately
-    // picks up the next available one (unlike par_iter which waits for the batch).
     rayon::in_place_scope(|s| {
         for (file_idx, input_file) in params.input_files.iter().enumerate() {
             let ref_id = (file_idx + 1) as u64;
-            let reader = crate::minimizer::open_fasta(input_file).unwrap();
-            let mut fasta_reader = paraseq::fasta::Reader::new(reader);
-            let mut record_set = fasta_reader.new_record_set();
+            let mut reader = needletail::parse_fastx_file(input_file)
+                .expect("failed to open FASTA file");
 
-            while record_set.fill(&mut fasta_reader).unwrap() {
-                for record_result in record_set.iter() {
-                    let record = record_result.unwrap();
-                    let seq = record.seq();
-                    let seq_len = seq.len();
+            while let Some(result) = reader.next() {
+                let record = result.expect("invalid FASTA record");
+                let seq = record.seq();
+                let seq_len = seq.len();
 
-                    if seq_len < K {
-                        continue;
+                if seq_len < K {
+                    continue;
+                }
+
+                let seq_name = std::str::from_utf8(record.id())
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+
+                let poly_n_stretch = params.poly_n_stretch;
+                let seg_writer = &seg_writer;
+                let seq_writer = &seq_writer;
+                let global_meta = &global_meta;
+                let budget = &budget;
+                // Sequences under 4 MB are copied and spawned async for
+                // between-sequence parallelism. Larger ones are processed
+                // synchronously with zero copy.
+                const LARGE_SEQ_THRESHOLD: usize = 4_000_000;
+
+                // Closure to build tiling line and write output.
+                let write_tiling = move |unitigs: &[OrientedUnitig],
+                                        local_meta: &UnipathsMeta| {
+                    let tiling_estimate = 64 + seq_name.len() + unitigs.len() * 14;
+                    let mut tiling = Vec::with_capacity(tiling_estimate);
+                    let mut ibuf = itoa::Buffer::new();
+
+                    tiling.extend_from_slice(b"Reference:");
+                    tiling.extend_from_slice(ibuf.format(ref_id).as_bytes());
+                    tiling.extend_from_slice(b"_Sequence:");
+                    tiling.extend_from_slice(seq_name.as_bytes());
+                    tiling.push(b'\t');
+
+                    if !unitigs.is_empty() {
+                        let first = &unitigs[0];
+
+                        if poly_n_stretch && first.start_kmer_idx > 0 {
+                            tiling.push(b'N');
+                            tiling.extend_from_slice(ibuf.format(first.start_kmer_idx).as_bytes());
+                            tiling.push(b' ');
+                        }
+
+                        tiling.extend_from_slice(ibuf.format(first.unitig_id).as_bytes());
+                        tiling.push(if first.dir == FWD { b'+' } else { b'-' });
+
+                        for i in 1..unitigs.len() {
+                            let left = &unitigs[i - 1];
+                            let right = &unitigs[i];
+
+                            if poly_n_stretch
+                                && (left.end_kmer_idx + 1) != right.start_kmer_idx
+                            {
+                                let nuc_gap =
+                                    right.start_kmer_idx as i64 - left.end_kmer_idx as i64;
+                                if nuc_gap >= (K as i64 + 1) {
+                                    let polyn_gap = nuc_gap as usize - K;
+                                    tiling.push(b' ');
+                                    tiling.push(b'N');
+                                    tiling.extend_from_slice(ibuf.format(polyn_gap).as_bytes());
+                                }
+                            }
+
+                            tiling.push(b' ');
+                            tiling.extend_from_slice(ibuf.format(right.unitig_id).as_bytes());
+                            tiling.push(if right.dir == FWD { b'+' } else { b'-' });
+                        }
                     }
 
-                    let seq_name = std::str::from_utf8(record.id())
-                        .unwrap_or("")
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
+                    tiling.push(b'\n');
 
+                    seq_writer.lock().unwrap().write_all(&tiling).ok();
+                    global_meta.lock().unwrap().aggregate(local_meta);
+                };
+
+                if seq_len < LARGE_SEQ_THRESHOLD {
+                    // Small sequence: copy and spawn async for between-sequence parallelism.
+                    budget.wait_and_acquire(seq_len);
                     let seq_owned = seq.to_vec();
-                    let poly_n_stretch = params.poly_n_stretch;
-                    let seg_writer = &seg_writer;
-                    let seq_writer = &seq_writer;
-                    let global_meta = &global_meta;
 
                     s.spawn(move |_| {
                         let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
@@ -211,62 +277,34 @@ where
                             &mut local_meta,
                         );
 
-                        // Flush remaining segment buffer.
                         if !seg_buf.is_empty() {
                             seg_writer.lock().unwrap().write_all(&seg_buf).ok();
                         }
 
-                        // Build tiling line using itoa for fast integer formatting.
-                        let tiling_estimate = 64 + seq_name.len() + unitigs.len() * 14;
-                        let mut tiling = Vec::with_capacity(tiling_estimate);
-                        let mut ibuf = itoa::Buffer::new();
-
-                        tiling.extend_from_slice(b"Reference:");
-                        tiling.extend_from_slice(ibuf.format(ref_id).as_bytes());
-                        tiling.extend_from_slice(b"_Sequence:");
-                        tiling.extend_from_slice(seq_name.as_bytes());
-                        tiling.push(b'\t');
-
-                        if !unitigs.is_empty() {
-                            let first = &unitigs[0];
-
-                            if poly_n_stretch && first.start_kmer_idx > 0 {
-                                tiling.push(b'N');
-                                tiling.extend_from_slice(ibuf.format(first.start_kmer_idx).as_bytes());
-                                tiling.push(b' ');
-                            }
-
-                            tiling.extend_from_slice(ibuf.format(first.unitig_id).as_bytes());
-                            tiling.push(if first.dir == FWD { b'+' } else { b'-' });
-
-                            for i in 1..unitigs.len() {
-                                let left = &unitigs[i - 1];
-                                let right = &unitigs[i];
-
-                                if poly_n_stretch
-                                    && (left.end_kmer_idx + 1) != right.start_kmer_idx
-                                {
-                                    let nuc_gap =
-                                        right.start_kmer_idx as i64 - left.end_kmer_idx as i64;
-                                    if nuc_gap >= (K as i64 + 1) {
-                                        let polyn_gap = nuc_gap as usize - K;
-                                        tiling.push(b' ');
-                                        tiling.push(b'N');
-                                        tiling.extend_from_slice(ibuf.format(polyn_gap).as_bytes());
-                                    }
-                                }
-
-                                tiling.push(b' ');
-                                tiling.extend_from_slice(ibuf.format(right.unitig_id).as_bytes());
-                                tiling.push(if right.dir == FWD { b'+' } else { b'-' });
-                            }
-                        }
-
-                        tiling.push(b'\n');
-
-                        seq_writer.lock().unwrap().write_all(&tiling).ok();
-                        global_meta.lock().unwrap().aggregate(&local_meta);
+                        write_tiling(&unitigs, &local_meta);
+                        budget.release(seq_len);
                     });
+                } else {
+                    // Large sequence: process synchronously with borrowed data (zero copy).
+                    let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
+                    let mut local_meta = UnipathsMeta::new();
+
+                    let unitigs = extract_unitigs_from_seq::<K>(
+                        &seq,
+                        seq_len,
+                        mphf,
+                        states,
+                        seg_writer,
+                        &mut seg_buf,
+                        K,
+                        &mut local_meta,
+                    );
+
+                    if !seg_buf.is_empty() {
+                        seg_writer.lock().unwrap().write_all(&seg_buf).ok();
+                    }
+
+                    write_tiling(&unitigs, &local_meta);
                 }
             }
         }
@@ -292,6 +330,7 @@ where
 }
 
 /// Extract unitigs from a single sequence, buffering segment output.
+#[allow(clippy::too_many_arguments)]
 fn extract_unitigs_from_seq<const K: usize>(
     seq: &[u8],
     seq_len: usize,
