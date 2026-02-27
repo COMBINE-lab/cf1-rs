@@ -71,7 +71,14 @@ cf1-rs produces three output files:
 
 ## Performance
 
-cf1-rs is designed for high performance on both small transcriptomes and large genomes. On the human genome (GRCh38, ~3.1 Gbp) with k=31 and 4 threads, cf1-rs constructs the compacted dBG in under 15 minutes, using about 6GB RAM.
+cf1-rs is designed for high performance on both small transcriptomes and large genomes. Benchmarks below were run on an Apple M3 Max with 4 threads and k=31.
+
+| Dataset | Vertices | Unitigs | Wall time | Peak RSS |
+|---------|----------|---------|-----------|----------|
+| Transcriptome (GENCODE v49 PC) | 96,334,486 | 1,077,924 | ~35 s | ~2.4 GB |
+| Genome (GRCh38 primary) | 2,501,077,719 | 35,776,107 | ~8 m | ~7.0 GB |
+
+Phase 5 (unitig extraction) uses within-sequence parallelism — large chromosomes are split into per-thread k-mer chunks processed concurrently — giving a ~3.4× speedup for that phase on 4 threads.
 
 ## License
 
