@@ -6,6 +6,7 @@ use crate::mphf::Mphf;
 use crate::params::Params;
 use crate::state::StateClass;
 use crate::state_vector::AtomicStateVector;
+use rayon::prelude::*;
 use std::io::Write;
 use std::sync::Mutex;
 use tracing::info;
@@ -144,7 +145,7 @@ fn is_unipath_end(
 }
 
 /// Threshold for flushing per-thread segment buffer to global writer.
-const SEG_BUFFER_THRESHOLD: usize = 100 * 1024; // 100 KB
+const SEG_BUFFER_THRESHOLD: usize = 4 * 1024 * 1024; // 4 MB
 
 /// Extract unitigs and write output for GFA-reduced format (format 3).
 /// Uses rayon::scope + spawn for work-stealing scheduling across sequences.
@@ -285,26 +286,49 @@ where
                         budget.release(seq_len);
                     });
                 } else {
-                    // Large sequence: process synchronously with borrowed data (zero copy).
-                    let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
+                    // Large sequence: copy + split into per-thread chunks + parallel extraction.
+                    // Each chunk processes an equal share of k-mer positions.  The existing
+                    // `output_unitigs_contiguous` loop naturally handles chunk boundaries: if it
+                    // is mid-unitig at `chunk_right_end` it continues until that unitig ends;
+                    // the next chunk then starts mid-sequence with `on_unipath = false` and
+                    // advances silently past the in-progress unitig.  Result: each unitig
+                    // appears in exactly one chunk's Vec<OrientedUnitig>.  Concatenating in
+                    // order gives a tiling identical to the serial path.
+                    let seq_owned = seq.to_vec();
+                    let num_chunks = rayon::current_num_threads().max(1);
+                    let chunks = compute_chunk_boundaries(seq_len, K, num_chunks);
+
+                    let chunk_results: Vec<(Vec<OrientedUnitig>, UnipathsMeta)> = chunks
+                        .into_par_iter()
+                        .map(|(chunk_start, chunk_right_end)| {
+                            let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
+                            let mut local_meta = UnipathsMeta::new();
+                            let unitigs = extract_unitigs_from_chunk::<K>(
+                                &seq_owned,
+                                seq_len,
+                                chunk_start,
+                                chunk_right_end,
+                                mphf,
+                                states,
+                                seg_writer,
+                                &mut seg_buf,
+                                K,
+                                &mut local_meta,
+                            );
+                            if !seg_buf.is_empty() {
+                                seg_writer.lock().unwrap().write_all(&seg_buf).ok();
+                            }
+                            (unitigs, local_meta)
+                        })
+                        .collect(); // preserves chunk order
+
+                    let mut all_unitigs: Vec<OrientedUnitig> = Vec::new();
                     let mut local_meta = UnipathsMeta::new();
-
-                    let unitigs = extract_unitigs_from_seq::<K>(
-                        &seq,
-                        seq_len,
-                        mphf,
-                        states,
-                        seg_writer,
-                        &mut seg_buf,
-                        K,
-                        &mut local_meta,
-                    );
-
-                    if !seg_buf.is_empty() {
-                        seg_writer.lock().unwrap().write_all(&seg_buf).ok();
+                    for (u, m) in chunk_results {
+                        all_unitigs.extend(u);
+                        local_meta.aggregate(&m);
                     }
-
-                    write_tiling(&unitigs, &local_meta);
+                    write_tiling(&all_unitigs, &local_meta);
                 }
             }
         }
@@ -368,6 +392,91 @@ where
             &mut unitigs,
             meta,
         );
+    }
+
+    unitigs
+}
+
+/// Compute chunk boundaries for within-sequence parallelism.
+///
+/// Returns a Vec of `(chunk_kmer_start, chunk_right_end_inclusive)` tuples that
+/// partition the k-mer start positions `0..=(seq_len - k)` into `num_chunks`
+/// approximately equal ranges.  Degenerate ranges (start >= end, possible when
+/// `seq_len` is tiny relative to `num_chunks`) are silently omitted.
+fn compute_chunk_boundaries(
+    seq_len: usize,
+    k: usize,
+    num_chunks: usize,
+) -> Vec<(usize, usize)> {
+    let total = seq_len.saturating_sub(k) + 1; // number of valid k-mer start positions
+    (0..num_chunks)
+        .filter_map(|i| {
+            let start = i * total / num_chunks;
+            let end = (i + 1) * total / num_chunks;
+            if start >= end {
+                None
+            } else {
+                Some((start, end - 1)) // (inclusive start, inclusive right_end)
+            }
+        })
+        .collect()
+}
+
+/// Extract unitigs from a contiguous sub-range of a sequence.
+///
+/// Identical to `extract_unitigs_from_seq` except that processing is confined to
+/// k-mer start positions `[chunk_start, chunk_right_end]` (both inclusive).
+///
+/// **Boundary behaviour**: when the loop reaches `chunk_right_end` while still
+/// on a unitig, `output_unitigs_contiguous` continues past the boundary until
+/// that unitig ends — the same mechanism used at placeholder boundaries.  The
+/// *next* chunk starts with `on_unipath = false`; since `is_unipath_start` is
+/// false for mid-unitig positions, it advances silently without recording the
+/// in-progress unitig.  Each unitig therefore appears in exactly one chunk's
+/// returned Vec, in k-mer-position order, so concatenating results in order
+/// produces a tiling identical to the serial path.
+#[allow(clippy::too_many_arguments)]
+fn extract_unitigs_from_chunk<const K: usize>(
+    seq: &[u8],
+    seq_len: usize,
+    chunk_start: usize,
+    chunk_right_end: usize,
+    mphf: &Mphf<K>,
+    states: &AtomicStateVector,
+    seg_writer: &Mutex<std::io::BufWriter<std::fs::File>>,
+    seg_buf: &mut Vec<u8>,
+    k: usize,
+    meta: &mut UnipathsMeta,
+) -> Vec<OrientedUnitig>
+where
+    Kmer<K>: KmerBits,
+{
+    let estimated = (chunk_right_end.saturating_sub(chunk_start) + 100) / 100;
+    let mut unitigs = Vec::with_capacity(estimated.max(64));
+    let absolute_right_end = seq_len - k;
+
+    let mut kmer_idx = chunk_start;
+    while kmer_idx <= absolute_right_end {
+        kmer_idx = search_valid_kmer::<K>(seq, kmer_idx, chunk_right_end);
+        if kmer_idx > chunk_right_end {
+            break;
+        }
+        kmer_idx = output_unitigs_contiguous::<K>(
+            seq,
+            seq_len,
+            chunk_right_end, // pass chunk boundary as right_end
+            kmer_idx,
+            mphf,
+            states,
+            seg_writer,
+            seg_buf,
+            k,
+            &mut unitigs,
+            meta,
+        );
+        if kmer_idx > chunk_right_end {
+            break; // completed a unitig that spanned the chunk boundary
+        }
     }
 
     unitigs
