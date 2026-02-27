@@ -16,4 +16,5 @@ debug
 # Project-specific
 test_data/
 cuttlefish/
+genome_phase_work/
 PLAN.md
