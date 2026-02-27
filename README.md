@@ -71,7 +71,7 @@ cf1-rs produces three output files:
 
 ## Performance
 
-cf1-rs is designed for high performance on both small transcriptomes and large genomes. On the human genome (GRCh38, ~3.1 Gbp) with k=31 and 4 threads, cf1-rs constructs the compacted dBG in under 10 minutes.
+cf1-rs is designed for high performance on both small transcriptomes and large genomes. On the human genome (GRCh38, ~3.1 Gbp) with k=31 and 4 threads, cf1-rs constructs the compacted dBG in under 15 minutes, using about 6GB RAM.
 
 ## License
 
