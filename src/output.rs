@@ -154,7 +154,7 @@ pub fn extract_and_output<const K: usize>(
     mphf: &Mphf<K>,
     states: &AtomicStateVector,
     budget: &InFlightBudget,
-) -> anyhow::Result<UnipathsMeta>
+) -> anyhow::Result<(UnipathsMeta, Vec<(String, usize)>)>
 where
     Kmer<K>: KmerBits,
 {
@@ -171,6 +171,7 @@ where
     let seq_writer = Mutex::new(std::io::BufWriter::new(seq_file));
 
     let global_meta = Mutex::new(UnipathsMeta::new());
+    let untiled_seqs = Mutex::new(Vec::new());
 
     rayon::in_place_scope(|s| {
         for (file_idx, input_file) in params.input_files.iter().enumerate() {
@@ -198,6 +199,7 @@ where
                 let seg_writer = &seg_writer;
                 let seq_writer = &seq_writer;
                 let global_meta = &global_meta;
+                let untiled_seqs = &untiled_seqs;
                 let budget = &budget;
                 // Sequences under 4 MB are copied and spawned async for
                 // between-sequence parallelism. Larger ones are processed
@@ -254,6 +256,9 @@ where
 
                     tiling.push(b'\n');
 
+                    if unitigs.is_empty() {
+                        untiled_seqs.lock().unwrap().push((seq_name.clone(), seq_len));
+                    }
                     seq_writer.lock().unwrap().write_all(&tiling).ok();
                     global_meta.lock().unwrap().aggregate(local_meta);
                 };
@@ -339,6 +344,7 @@ where
     seq_writer.lock().unwrap().flush()?;
 
     let result = global_meta.into_inner().unwrap();
+    let untiled_seqs = untiled_seqs.into_inner().unwrap();
     info!(
         "Extracted {} unitigs, {} vertices, avg length {}",
         result.unipath_count,
@@ -350,7 +356,7 @@ where
         }
     );
 
-    Ok(result)
+    Ok((result, untiled_seqs))
 }
 
 /// Extract unitigs from a single sequence, buffering segment output.
@@ -786,6 +792,7 @@ pub fn write_json(
     params: &Params,
     meta: &UnipathsMeta,
     short_seqs: &[(String, usize)],
+    untiled_seqs: &[(String, usize)],
 ) -> anyhow::Result<()> {
     let json_path = params.json_file_path();
 
@@ -826,9 +833,64 @@ pub fn write_json(
         json["short seqs"] = serde_json::Value::Array(short_seqs_json);
     }
 
+    if !untiled_seqs.is_empty() {
+        let untiled_seqs_json: Vec<serde_json::Value> = untiled_seqs
+            .iter()
+            .map(|(name, len)| serde_json::json!([name, len]))
+            .collect();
+        json["untiled seqs"] = serde_json::Value::Array(untiled_seqs_json);
+    }
+
     let json_str = serde_json::to_string_pretty(&json)?;
     std::fs::write(&json_path, json_str)?;
 
     info!("Wrote JSON output to {}", json_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::params::Params;
+
+    #[test]
+    fn test_write_json_includes_untiled_seqs() {
+        let dir = std::env::temp_dir().join(format!("cf1_rs_output_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("input.fa");
+        std::fs::write(&input, b">ref\nACGT\n").unwrap();
+
+        let output_prefix = dir.join("index");
+        let params = Params::from_resolved(
+            vec![input],
+            31,
+            1,
+            output_prefix,
+            3,
+            Some(dir.clone()),
+            true,
+            true,
+            true,
+            8,
+            1.0,
+        )
+        .unwrap();
+
+        let meta = UnipathsMeta::new();
+        let short_seqs = vec![("short_ref".to_string(), 12)];
+        let untiled_seqs = vec![("all_n_ref".to_string(), 337)];
+
+        write_json(&params, &meta, &short_seqs, &untiled_seqs).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(params.json_file_path()).unwrap()).unwrap();
+        assert_eq!(json["short seqs"][0], serde_json::json!(["short_ref", 12]));
+        assert_eq!(json["untiled seqs"][0], serde_json::json!(["all_n_ref", 337]));
+
+        std::fs::remove_file(params.json_file_path()).ok();
+        std::fs::remove_file(params.sequence_file_path()).ok();
+        std::fs::remove_file(params.segment_file_path()).ok();
+        std::fs::remove_file(dir.join("input.fa")).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

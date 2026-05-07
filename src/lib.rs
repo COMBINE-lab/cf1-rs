@@ -50,6 +50,8 @@ pub struct CfBuildResult {
     pub sum_unitig_len: u64,
     /// Input sequences shorter than k (name, length).
     pub short_seqs: Vec<(String, usize)>,
+    /// Input sequences with length >= k that produced no tiles (name, length).
+    pub untiled_seqs: Vec<(String, usize)>,
 }
 
 /// Build a compacted de Bruijn graph from input sequences.
@@ -142,12 +144,17 @@ where
     Kmer<K>: KmerBits,
     <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
 {
-    let (meta, short_seqs) = run_pipeline::<K>(params)?;
-    Ok(build_result(params, &meta, short_seqs))
+    let (meta, short_seqs, untiled_seqs) = run_pipeline::<K>(params)?;
+    Ok(build_result(params, &meta, short_seqs, untiled_seqs))
 }
 
 /// Map pipeline outputs to `CfBuildResult`.
-fn build_result(params: &Params, meta: &UnipathsMeta, short_seqs: Vec<(String, usize)>) -> CfBuildResult {
+fn build_result(
+    params: &Params,
+    meta: &UnipathsMeta,
+    short_seqs: Vec<(String, usize)>,
+    untiled_seqs: Vec<(String, usize)>,
+) -> CfBuildResult {
     CfBuildResult {
         seg_file: params.segment_file_path(),
         seq_file: params.sequence_file_path(),
@@ -158,5 +165,6 @@ fn build_result(params: &Params, meta: &UnipathsMeta, short_seqs: Vec<(String, u
         min_unitig_len: if meta.min_len == usize::MAX { 0 } else { meta.min_len },
         sum_unitig_len: meta.sum_len,
         short_seqs,
+        untiled_seqs,
     }
 }

@@ -63,7 +63,9 @@ pub fn current_rss_mb() -> usize {
         / 1024
 }
 
-pub fn run_pipeline<const K: usize>(params: &Params) -> anyhow::Result<(crate::output::UnipathsMeta, Vec<(String, usize)>)>
+pub fn run_pipeline<const K: usize>(
+    params: &Params,
+) -> anyhow::Result<(crate::output::UnipathsMeta, Vec<(String, usize)>, Vec<(String, usize)>)>
 where
     Kmer<K>: KmerBits,
     <Kmer<K> as KmerBits>::Storage: crate::mphf::RadixSortDedup,
@@ -106,13 +108,13 @@ where
 
     // Phase 5: Output.
     info!("Phase 5: Extracting unitigs and writing output...");
-    let meta = extract_and_output::<K>(params, &mphf, &states, &budget)?;
+    let (meta, untiled_seqs) = extract_and_output::<K>(params, &mphf, &states, &budget)?;
     purge_allocator();
     info!("RSS after P5: current={} MB, peak={} MB", current_rss_mb(), peak_rss_mb());
 
     // Write JSON.
-    write_json(params, &meta, &short_seqs)?;
+    write_json(params, &meta, &short_seqs, &untiled_seqs)?;
 
     info!("Pipeline complete.");
-    Ok((meta, short_seqs))
+    Ok((meta, short_seqs, untiled_seqs))
 }
