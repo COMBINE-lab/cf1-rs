@@ -1,11 +1,11 @@
 use crate::budget::InFlightBudget;
 use crate::directed_kmer::DirectedKmer;
-use crate::dna::{is_placeholder, Base};
+use crate::directed_kmer::FWD;
+use crate::dna::{Base, is_placeholder};
 use crate::kmer::{Kmer, KmerBits};
 use crate::mphf::Mphf;
 use crate::state::{State, StateClass, Vertex};
 use crate::state_vector::AtomicStateVector;
-use crate::directed_kmer::FWD;
 use std::sync::Mutex;
 
 /// Target chunk size (k-mer positions) for splitting large sequences.
@@ -539,8 +539,8 @@ where
 
     rayon::in_place_scope(|s| {
         for input_file in &params.input_files {
-            let mut reader = needletail::parse_fastx_file(input_file)
-                .expect("failed to open FASTA file");
+            let mut reader =
+                needletail::parse_fastx_file(input_file).expect("failed to open FASTA file");
 
             while let Some(result) = reader.next() {
                 let record = result.expect("invalid FASTA record");

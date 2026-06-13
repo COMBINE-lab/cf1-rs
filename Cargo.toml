@@ -1,7 +1,8 @@
 [package]
 name = "cf1-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+rust-version = "1.91"
 authors = ["Rob Patro <rob@cs.umd.edu>"]
 description = "Fast construction of compacted reference de Bruijn graphs"
 license = "BSD-3-Clause"

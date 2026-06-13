@@ -2,7 +2,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "cf1-rs", about = "Compacted reference de Bruijn graph construction")]
+#[command(
+    name = "cf1-rs",
+    about = "Compacted reference de Bruijn graph construction"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -120,10 +123,7 @@ impl Params {
                 let entry = entry?;
                 let path = entry.path();
                 if path.is_file() {
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if matches!(ext, "fa" | "fasta" | "fna" | "gz") {
                         input_files.push(path);
                     }

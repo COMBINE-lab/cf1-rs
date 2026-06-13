@@ -1,5 +1,5 @@
 use crate::budget::InFlightBudget;
-use crate::dna::{is_placeholder, Base};
+use crate::dna::{Base, is_placeholder};
 use crate::minimizer::Partitioning;
 use crate::params::Params;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -43,8 +43,8 @@ pub fn route_superkmers(
 
     rayon::in_place_scope(|s| {
         for input_file in &params.input_files {
-            let mut reader = needletail::parse_fastx_file(input_file)
-                .expect("failed to open FASTA file");
+            let mut reader =
+                needletail::parse_fastx_file(input_file).expect("failed to open FASTA file");
 
             while let Some(result) = reader.next() {
                 let record = result.expect("invalid FASTA record");

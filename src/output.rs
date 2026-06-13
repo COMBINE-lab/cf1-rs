@@ -176,8 +176,8 @@ where
     rayon::in_place_scope(|s| {
         for (file_idx, input_file) in params.input_files.iter().enumerate() {
             let ref_id = (file_idx + 1) as u64;
-            let mut reader = needletail::parse_fastx_file(input_file)
-                .expect("failed to open FASTA file");
+            let mut reader =
+                needletail::parse_fastx_file(input_file).expect("failed to open FASTA file");
 
             while let Some(result) = reader.next() {
                 let record = result.expect("invalid FASTA record");
@@ -207,8 +207,7 @@ where
                 const LARGE_SEQ_THRESHOLD: usize = 4_000_000;
 
                 // Closure to build tiling line and write output.
-                let write_tiling = move |unitigs: &[OrientedUnitig],
-                                        local_meta: &UnipathsMeta| {
+                let write_tiling = move |unitigs: &[OrientedUnitig], local_meta: &UnipathsMeta| {
                     let tiling_estimate = 64 + seq_name.len() + unitigs.len() * 14;
                     let mut tiling = Vec::with_capacity(tiling_estimate);
                     let mut ibuf = itoa::Buffer::new();
@@ -235,9 +234,7 @@ where
                             let left = &unitigs[i - 1];
                             let right = &unitigs[i];
 
-                            if poly_n_stretch
-                                && (left.end_kmer_idx + 1) != right.start_kmer_idx
-                            {
+                            if poly_n_stretch && (left.end_kmer_idx + 1) != right.start_kmer_idx {
                                 let nuc_gap =
                                     right.start_kmer_idx as i64 - left.end_kmer_idx as i64;
                                 if nuc_gap >= (K as i64 + 1) {
@@ -257,7 +254,10 @@ where
                     tiling.push(b'\n');
 
                     if unitigs.is_empty() {
-                        untiled_seqs.lock().unwrap().push((seq_name.clone(), seq_len));
+                        untiled_seqs
+                            .lock()
+                            .unwrap()
+                            .push((seq_name.clone(), seq_len));
                     }
                     seq_writer.lock().unwrap().write_all(&tiling).ok();
                     global_meta.lock().unwrap().aggregate(local_meta);
@@ -409,11 +409,7 @@ where
 /// partition the k-mer start positions `0..=(seq_len - k)` into `num_chunks`
 /// approximately equal ranges.  Degenerate ranges (start >= end, possible when
 /// `seq_len` is tiny relative to `num_chunks`) are silently omitted.
-fn compute_chunk_boundaries(
-    seq_len: usize,
-    k: usize,
-    num_chunks: usize,
-) -> Vec<(usize, usize)> {
+fn compute_chunk_boundaries(seq_len: usize, k: usize, num_chunks: usize) -> Vec<(usize, usize)> {
     let total = seq_len.saturating_sub(k) + 1; // number of valid k-mer start positions
     (0..num_chunks)
         .filter_map(|i| {
@@ -536,30 +532,13 @@ where
 
     if no_left && no_right {
         output_gfa_unitig::<K>(
-            seq,
-            &curr_kmer,
-            &curr_kmer,
-            mphf,
-            states,
-            seg_writer,
-            seg_buf,
-            k,
-            unitigs,
-            meta,
+            seq, &curr_kmer, &curr_kmer, mphf, states, seg_writer, seg_buf, k, unitigs, meta,
         );
     } else {
         if no_right {
             if no_left {
                 output_gfa_unitig::<K>(
-                    seq,
-                    &curr_kmer,
-                    &curr_kmer,
-                    mphf,
-                    states,
-                    seg_writer,
-                    seg_buf,
-                    k,
-                    unitigs,
+                    seq, &curr_kmer, &curr_kmer, mphf, states, seg_writer, seg_buf, k, unitigs,
                     meta,
                 );
             } else {
@@ -576,15 +555,7 @@ where
                     prev_kmer.dir(),
                 ) {
                     output_gfa_unitig::<K>(
-                        seq,
-                        &curr_kmer,
-                        &curr_kmer,
-                        mphf,
-                        states,
-                        seg_writer,
-                        seg_buf,
-                        k,
-                        unitigs,
+                        seq, &curr_kmer, &curr_kmer, mphf, states, seg_writer, seg_buf, k, unitigs,
                         meta,
                     );
                 }
@@ -885,7 +856,10 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(params.json_file_path()).unwrap()).unwrap();
         assert_eq!(json["short seqs"][0], serde_json::json!(["short_ref", 12]));
-        assert_eq!(json["untiled seqs"][0], serde_json::json!(["all_n_ref", 337]));
+        assert_eq!(
+            json["untiled seqs"][0],
+            serde_json::json!(["all_n_ref", 337])
+        );
 
         std::fs::remove_file(params.json_file_path()).ok();
         std::fs::remove_file(params.sequence_file_path()).ok();

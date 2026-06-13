@@ -37,10 +37,7 @@ fn purge_allocator() {
     #[cfg(target_os = "macos")]
     unsafe {
         unsafe extern "C" {
-            fn malloc_zone_pressure_relief(
-                zone: *mut std::ffi::c_void,
-                goal: usize,
-            ) -> usize;
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
         }
         malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
     }
@@ -65,12 +62,20 @@ pub fn current_rss_mb() -> usize {
 
 pub fn run_pipeline<const K: usize>(
     params: &Params,
-) -> anyhow::Result<(crate::output::UnipathsMeta, Vec<(String, usize)>, Vec<(String, usize)>)>
+) -> anyhow::Result<(
+    crate::output::UnipathsMeta,
+    Vec<(String, usize)>,
+    Vec<(String, usize)>,
+)>
 where
     Kmer<K>: KmerBits,
     <Kmer<K> as KmerBits>::Storage: crate::mphf::RadixSortDedup,
 {
-    info!("RSS at start: current={} MB, peak={} MB", current_rss_mb(), peak_rss_mb());
+    info!(
+        "RSS at start: current={} MB, peak={} MB",
+        current_rss_mb(),
+        peak_rss_mb()
+    );
 
     let budget = InFlightBudget::new(DEFAULT_IN_FLIGHT_BYTES);
 
@@ -78,7 +83,11 @@ where
     info!("Phase 1: Counting minimizer frequencies...");
     let histogram = count_minimizer_histogram(params, &budget)?;
     purge_allocator();
-    info!("RSS after P1: current={} MB, peak={} MB", current_rss_mb(), peak_rss_mb());
+    info!(
+        "RSS after P1: current={} MB, peak={} MB",
+        current_rss_mb(),
+        peak_rss_mb()
+    );
 
     // Phase 2: Partition + route super k-mers.
     info!("Phase 2: Partitioning minimizers and routing super k-mers...");
@@ -86,16 +95,28 @@ where
     drop(histogram);
     route_superkmers(params, &partitioning, &budget)?;
     purge_allocator();
-    info!("RSS after P2: current={} MB, peak={} MB", current_rss_mb(), peak_rss_mb());
+    info!(
+        "RSS after P2: current={} MB, peak={} MB",
+        current_rss_mb(),
+        peak_rss_mb()
+    );
 
     // Phase 3: Build global MPHF.
     info!("Phase 3: Building global MPHF...");
     let num_bins = partitioning.num_bins();
     let mphf = Mphf::<K>::build(&partitioning, &params.work_dir, params.memory_budget_bytes)?;
     purge_allocator();
-    info!("RSS after P3 MPHF: current={} MB, peak={} MB", current_rss_mb(), peak_rss_mb());
+    info!(
+        "RSS after P3 MPHF: current={} MB, peak={} MB",
+        current_rss_mb(),
+        peak_rss_mb()
+    );
     let states = AtomicStateVector::new(mphf.total_kmers() as usize);
-    info!("RSS after P3 StateVector: current={} MB, peak={} MB", current_rss_mb(), peak_rss_mb());
+    info!(
+        "RSS after P3 StateVector: current={} MB, peak={} MB",
+        current_rss_mb(),
+        peak_rss_mb()
+    );
 
     // Clean up bin temp files.
     cleanup_bin_files(&params.work_dir, num_bins);
@@ -104,13 +125,21 @@ where
     info!("Phase 4: Classifying k-mer vertices...");
     let short_seqs = classify_vertices::<K>(params, &mphf, &states, &budget)?;
     purge_allocator();
-    info!("RSS after P4: current={} MB, peak={} MB", current_rss_mb(), peak_rss_mb());
+    info!(
+        "RSS after P4: current={} MB, peak={} MB",
+        current_rss_mb(),
+        peak_rss_mb()
+    );
 
     // Phase 5: Output.
     info!("Phase 5: Extracting unitigs and writing output...");
     let (meta, untiled_seqs) = extract_and_output::<K>(params, &mphf, &states, &budget)?;
     purge_allocator();
-    info!("RSS after P5: current={} MB, peak={} MB", current_rss_mb(), peak_rss_mb());
+    info!(
+        "RSS after P5: current={} MB, peak={} MB",
+        current_rss_mb(),
+        peak_rss_mb()
+    );
 
     // Write JSON.
     write_json(params, &meta, &short_seqs, &untiled_seqs)?;

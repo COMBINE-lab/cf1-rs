@@ -43,8 +43,8 @@ pub fn count_minimizer_histogram(
 
     rayon::in_place_scope(|s| {
         for input_file in &params.input_files {
-            let mut reader = needletail::parse_fastx_file(input_file)
-                .expect("failed to open FASTA file");
+            let mut reader =
+                needletail::parse_fastx_file(input_file).expect("failed to open FASTA file");
 
             while let Some(result) = reader.next() {
                 let record = result.expect("invalid FASTA record");
@@ -87,7 +87,10 @@ pub fn count_minimizer_histogram(
         }
     });
 
-    let counts: Vec<u64> = histogram.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    let counts: Vec<u64> = histogram
+        .iter()
+        .map(|a| a.load(Ordering::Relaxed))
+        .collect();
     let total: u64 = counts.iter().sum();
     let nonzero = counts.iter().filter(|&&c| c > 0).count();
     info!(
@@ -113,10 +116,7 @@ fn count_minimizers_chunk(seq: &[u8], m: usize, w: usize, histogram: &[AtomicU64
 /// Walks buckets left-to-right, placing bin boundaries when the accumulated
 /// count reaches the target per bin. Boundaries are expressed as bucket indices;
 /// `bin_for_minimizer` hashes values to buckets using the same hash function.
-pub fn partition_minimizers(
-    histogram: &[u64],
-    num_bins: usize,
-) -> anyhow::Result<Partitioning> {
+pub fn partition_minimizers(histogram: &[u64], num_bins: usize) -> anyhow::Result<Partitioning> {
     let total_count: u64 = histogram.iter().sum();
     let target_per_bin = total_count / num_bins as u64;
 
@@ -182,4 +182,3 @@ impl Partitioning {
         self.num_bins
     }
 }
-

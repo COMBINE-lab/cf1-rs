@@ -46,11 +46,7 @@ pub fn is_placeholder(b: u8) -> bool {
 /// Upper-case an ASCII DNA character matching C++ DNA_Utility::upper.
 #[inline]
 pub fn to_upper(b: u8) -> u8 {
-    if b <= b'T' {
-        b
-    } else {
-        b - (b'a' - b'A')
-    }
+    if b <= b'T' { b } else { b - (b'a' - b'A') }
 }
 
 /// Complement of an ASCII base character. Returns 'N' for non-ACGT.

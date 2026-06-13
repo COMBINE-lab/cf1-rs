@@ -88,9 +88,9 @@ pub fn cf_build(
         output_prefix,
         3, // format=3 (GFA-reduced)
         work_dir,
-        true,  // track_short_seqs
-        true,  // poly_n_stretch
-        true,  // collate_in_mem
+        true, // track_short_seqs
+        true, // poly_n_stretch
+        true, // collate_in_mem
         num_bins,
         memory_budget_gb,
     )?;
@@ -123,10 +123,7 @@ fn resolve_input_files(input: &CfInput) -> anyhow::Result<Vec<PathBuf>> {
                 let entry = entry?;
                 let path = entry.path();
                 if path.is_file() {
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if matches!(ext, "fa" | "fasta" | "fna" | "gz" | "fq" | "fastq") {
                         files.push(path);
                     }
@@ -162,7 +159,11 @@ fn build_result(
         vertex_count: meta.kmer_count,
         unitig_count: meta.unipath_count,
         max_unitig_len: meta.max_len,
-        min_unitig_len: if meta.min_len == usize::MAX { 0 } else { meta.min_len },
+        min_unitig_len: if meta.min_len == usize::MAX {
+            0
+        } else {
+            meta.min_len
+        },
         sum_unitig_len: meta.sum_len,
         short_seqs,
         untiled_seqs,
