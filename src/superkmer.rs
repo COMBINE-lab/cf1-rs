@@ -63,7 +63,16 @@ pub fn route_superkmers(
                     let budget = &budget;
 
                     s.spawn(move |_| {
-                        route_chunk(&seq_owned, m, w, k, num_bins, partitioning, writers, params.poly_n_stretch);
+                        route_chunk(
+                            &seq_owned,
+                            m,
+                            w,
+                            k,
+                            num_bins,
+                            partitioning,
+                            writers,
+                            params.poly_n_stretch,
+                        );
                         budget.release(seq_len);
                     });
                 } else {
@@ -80,7 +89,16 @@ pub fn route_superkmers(
                             let writers = &writers;
 
                             inner.spawn(move |_| {
-                                route_chunk(chunk, m, w, k, num_bins, partitioning, writers, params.poly_n_stretch);
+                                route_chunk(
+                                    chunk,
+                                    m,
+                                    w,
+                                    k,
+                                    num_bins,
+                                    partitioning,
+                                    writers,
+                                    params.poly_n_stretch,
+                                );
                             });
                             start += CHUNK_BASES;
                         }

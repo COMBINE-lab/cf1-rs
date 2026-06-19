@@ -77,7 +77,13 @@ pub fn count_minimizer_histogram(
                             let histogram = &histogram;
 
                             inner.spawn(move |_| {
-                                count_minimizers_chunk(chunk, m, w, histogram, params.poly_n_stretch);
+                                count_minimizers_chunk(
+                                    chunk,
+                                    m,
+                                    w,
+                                    histogram,
+                                    params.poly_n_stretch,
+                                );
                             });
                             start += CHUNK_BASES;
                         }

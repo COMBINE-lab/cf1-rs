@@ -51,8 +51,10 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Bump version in Cargo.toml.
-sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+# Bump version in Cargo.toml (portable in-place edit: GNU sed needs no suffix
+# arg, BSD/macOS sed needs one — `-i.bak` + rm works on both).
+sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+rm -f Cargo.toml.bak
 
 # Update Cargo.lock.
 cargo update --workspace --quiet

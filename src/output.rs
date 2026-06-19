@@ -238,8 +238,9 @@ where
                 // is the in-flight budget to release once this tiling is actually
                 // written (the small-sequence path passes its `seq_len`; the
                 // large-sequence path, which does not take a budget slot, passes 0).
-                let write_tiling =
-                    move |unitigs: &[OrientedUnitig], local_meta: &UnipathsMeta, release_len: usize| {
+                let write_tiling = move |unitigs: &[OrientedUnitig],
+                                         local_meta: &UnipathsMeta,
+                                         release_len: usize| {
                     let tiling_estimate = 64 + seq_name.len() + unitigs.len() * 14;
                     let mut tiling = Vec::with_capacity(tiling_estimate);
                     let mut ibuf = itoa::Buffer::new();

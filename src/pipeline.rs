@@ -60,13 +60,17 @@ pub fn current_rss_mb() -> usize {
         / 1024
 }
 
-pub fn run_pipeline<const K: usize>(
-    params: &Params,
-) -> anyhow::Result<(
+/// Output of [`run_pipeline`]: the unitig/tiling metadata, plus two `(name, length)`
+/// lists of input sequences that produced no tiles — `short_seqs` (length `< k`) and
+/// `untiled_seqs` (length `>= k` but no run of `>= k` consecutive ACGT bases, e.g.
+/// a sequence fragmented below `k` by `N`s).
+pub type PipelineResult = (
     crate::output::UnipathsMeta,
     Vec<(String, usize)>,
     Vec<(String, usize)>,
-)>
+);
+
+pub fn run_pipeline<const K: usize>(params: &Params) -> anyhow::Result<PipelineResult>
 where
     Kmer<K>: KmerBits,
     <Kmer<K> as KmerBits>::Storage: crate::mphf::RadixSortDedup,
