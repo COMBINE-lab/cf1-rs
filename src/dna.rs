@@ -43,6 +43,32 @@ pub fn is_placeholder(b: u8) -> bool {
     IS_PLACEHOLDER[b as usize]
 }
 
+/// Invoke `f(seg_start, segment)` for each maximal run of non-placeholder
+/// (ACGT) bases of length `>= k`. Cuttlefish handles ambiguous (`N`) bases by
+/// splitting a sequence on them — no k-mer spans a placeholder — exactly as the
+/// classification and super-k-mer packing phases already do. Runs shorter than `k`
+/// carry no k-mers and are skipped. `seg_start` is the offset of the segment in
+/// `seq` (callers that only need k-mer *content*, e.g. minimizer counting and
+/// super-k-mer routing, can ignore it).
+#[inline]
+pub fn for_each_acgt_segment(seq: &[u8], k: usize, mut f: impl FnMut(usize, &[u8])) {
+    let n = seq.len();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        if is_placeholder(seq[i]) {
+            if i - start >= k {
+                f(start, &seq[start..i]);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if n - start >= k {
+        f(start, &seq[start..n]);
+    }
+}
+
 /// Upper-case an ASCII DNA character matching C++ DNA_Utility::upper.
 #[inline]
 pub fn to_upper(b: u8) -> u8 {

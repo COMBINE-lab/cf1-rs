@@ -115,39 +115,47 @@ fn route_chunk(
     let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); num_bins];
     let mut pack_buf: Vec<u8> = Vec::new();
 
-    let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seq);
-    let output = simd_minimizers::canonical_minimizers(m, w)
-        .super_kmers(&mut skmer_positions)
-        .run(ascii_seq, &mut positions);
+    // Split on placeholder (`N`) bases so `simd_minimizers`/packed-seq only sees
+    // ACGT (it panics otherwise); a super k-mer never spans a placeholder. Only
+    // k-mer *content* is packed (positions are not stored), so each ACGT segment
+    // is processed independently with its own local positions — no global offset.
+    crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
+        positions.clear();
+        skmer_positions.clear();
+        let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seg);
+        let output = simd_minimizers::canonical_minimizers(m, w)
+            .super_kmers(&mut skmer_positions)
+            .run(ascii_seq, &mut positions);
 
-    let pos_vals: Vec<(u32, u64)> = output.pos_and_values_u64().collect();
-    let num_skmers = pos_vals.len();
+        let pos_vals: Vec<(u32, u64)> = output.pos_and_values_u64().collect();
+        let num_skmers = pos_vals.len();
 
-    for sk_idx in 0..num_skmers {
-        let start_kmer_pos = skmer_positions[sk_idx] as usize;
-        let end_kmer_pos = if sk_idx + 1 < num_skmers {
-            skmer_positions[sk_idx + 1] as usize
-        } else {
-            seq.len() - k + 1
-        };
+        for sk_idx in 0..num_skmers {
+            let start_kmer_pos = skmer_positions[sk_idx] as usize;
+            let end_kmer_pos = if sk_idx + 1 < num_skmers {
+                skmer_positions[sk_idx + 1] as usize
+            } else {
+                seg.len() - k + 1
+            };
 
-        if end_kmer_pos <= start_kmer_pos {
-            continue;
+            if end_kmer_pos <= start_kmer_pos {
+                continue;
+            }
+
+            let seq_start = start_kmer_pos;
+            let seq_end = end_kmer_pos - 1 + k;
+
+            if seq_end > seg.len() {
+                continue;
+            }
+
+            let subseq = &seg[seq_start..seq_end];
+            let hash = pos_vals[sk_idx].1;
+            let bin = partitioning.bin_for_minimizer(hash);
+
+            write_packed_segments(subseq, k, bin, &mut buffers, writers, &mut pack_buf);
         }
-
-        let seq_start = start_kmer_pos;
-        let seq_end = end_kmer_pos - 1 + k;
-
-        if seq_end > seq.len() {
-            continue;
-        }
-
-        let subseq = &seq[seq_start..seq_end];
-        let hash = pos_vals[sk_idx].1;
-        let bin = partitioning.bin_for_minimizer(hash);
-
-        write_packed_segments(subseq, k, bin, &mut buffers, writers, &mut pack_buf);
-    }
+    });
 
     flush_all_buffers(&mut buffers, writers);
 }

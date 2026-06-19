@@ -100,16 +100,21 @@ pub fn count_minimizer_histogram(
     Ok(counts)
 }
 
-/// Count minimizers in a sequence chunk into the shared histogram.
+/// Count minimizers in a sequence chunk into the shared histogram. Splits on
+/// placeholder (`N`) bases so `simd_minimizers`/packed-seq only ever sees ACGT
+/// (it panics on other bytes); k-mers never span a placeholder.
 fn count_minimizers_chunk(seq: &[u8], m: usize, w: usize, histogram: &[AtomicU64]) {
+    let k = w + m - 1;
     let mut positions: Vec<u32> = Vec::new();
-    let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seq);
-    let output = simd_minimizers::canonical_minimizers(m, w).run(ascii_seq, &mut positions);
-
-    for (_pos, val) in output.pos_and_values_u64() {
-        let bucket = bucket_hash(val);
-        histogram[bucket].fetch_add(1, Ordering::Relaxed);
-    }
+    crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
+        positions.clear();
+        let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seg);
+        let output = simd_minimizers::canonical_minimizers(m, w).run(ascii_seq, &mut positions);
+        for (_pos, val) in output.pos_and_values_u64() {
+            let bucket = bucket_hash(val);
+            histogram[bucket].fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }
 
 /// Partition minimizers into bins based on the histogram.
