@@ -173,7 +173,30 @@ where
     let global_meta = Mutex::new(UnipathsMeta::new());
     let untiled_seqs = Mutex::new(Vec::new());
 
+    // When `synchronize_output` is set, the `.cf_seq` tiling is written in input
+    // order (so reference numbering is deterministic and equals input order, which
+    // salmon needs to keep its decoy block contiguous) — default off, preserving
+    // the faster task-completion-order output for general use.
+    //
+    // To stay memory-bounded we do NOT collect every tiling and sort at the end
+    // (the genome's tiling alone can be huge). Instead each finished tiling is
+    // placed in a small reorder buffer keyed by input index, and the longest
+    // already-contiguous prefix is flushed immediately. Crucially, a small
+    // sequence's in-flight budget is released only when its tiling is *written*
+    // (not when it is computed), so a completed-but-not-yet-writable tiling keeps
+    // holding its slot — bounding the buffer to the number of in-flight sequences.
+    let synchronize = params.synchronize_output;
+    struct OrderState {
+        next: usize,
+        pending: std::collections::HashMap<usize, (Vec<u8>, usize)>,
+    }
+    let order_state: Mutex<OrderState> = Mutex::new(OrderState {
+        next: 0,
+        pending: std::collections::HashMap::new(),
+    });
+
     rayon::in_place_scope(|s| {
+        let mut next_seq_idx: usize = 0;
         for (file_idx, input_file) in params.input_files.iter().enumerate() {
             let ref_id = (file_idx + 1) as u64;
             let mut reader =
@@ -187,6 +210,10 @@ where
                 if seq_len < K {
                     continue;
                 }
+                // Input-order index of this reference (only sequences >= K get a
+                // tiling line, matching how the references are numbered downstream).
+                let seq_idx = next_seq_idx;
+                next_seq_idx += 1;
 
                 let seq_name = std::str::from_utf8(record.id())
                     .unwrap_or("")
@@ -200,14 +227,19 @@ where
                 let seq_writer = &seq_writer;
                 let global_meta = &global_meta;
                 let untiled_seqs = &untiled_seqs;
+                let order_state = &order_state;
                 let budget = &budget;
                 // Sequences under 4 MB are copied and spawned async for
                 // between-sequence parallelism. Larger ones are processed
                 // synchronously with zero copy.
                 const LARGE_SEQ_THRESHOLD: usize = 4_000_000;
 
-                // Closure to build tiling line and write output.
-                let write_tiling = move |unitigs: &[OrientedUnitig], local_meta: &UnipathsMeta| {
+                // Closure to build the tiling line and emit output. `release_len`
+                // is the in-flight budget to release once this tiling is actually
+                // written (the small-sequence path passes its `seq_len`; the
+                // large-sequence path, which does not take a budget slot, passes 0).
+                let write_tiling =
+                    move |unitigs: &[OrientedUnitig], local_meta: &UnipathsMeta, release_len: usize| {
                     let tiling_estimate = 64 + seq_name.len() + unitigs.len() * 14;
                     let mut tiling = Vec::with_capacity(tiling_estimate);
                     let mut ibuf = itoa::Buffer::new();
@@ -259,7 +291,24 @@ where
                             .unwrap()
                             .push((seq_name.clone(), seq_len));
                     }
-                    seq_writer.lock().unwrap().write_all(&tiling).ok();
+                    if synchronize {
+                        // Buffer this tiling and flush the longest contiguous
+                        // prefix in input order, releasing each written sequence's
+                        // budget as it goes (bounding the buffer to in-flight count).
+                        let mut st = order_state.lock().unwrap();
+                        st.pending.insert(seq_idx, (tiling, release_len));
+                        let mut n = st.next;
+                        while let Some((t, len)) = st.pending.remove(&n) {
+                            seq_writer.lock().unwrap().write_all(&t).ok();
+                            if len > 0 {
+                                budget.release(len);
+                            }
+                            n += 1;
+                        }
+                        st.next = n;
+                    } else {
+                        seq_writer.lock().unwrap().write_all(&tiling).ok();
+                    }
                     global_meta.lock().unwrap().aggregate(local_meta);
                 };
 
@@ -287,8 +336,13 @@ where
                             seg_writer.lock().unwrap().write_all(&seg_buf).ok();
                         }
 
-                        write_tiling(&unitigs, &local_meta);
-                        budget.release(seq_len);
+                        // In synchronize mode `write_tiling` releases the budget
+                        // when the tiling is actually written (release_len = seq_len);
+                        // otherwise release it here, on completion.
+                        write_tiling(&unitigs, &local_meta, seq_len);
+                        if !synchronize {
+                            budget.release(seq_len);
+                        }
                     });
                 } else {
                     // Large sequence: copy + split into per-thread chunks + parallel extraction.
@@ -333,11 +387,19 @@ where
                         all_unitigs.extend(u);
                         local_meta.aggregate(&m);
                     }
-                    write_tiling(&all_unitigs, &local_meta);
+                    // Large sequences take no budget slot, so nothing to release.
+                    write_tiling(&all_unitigs, &local_meta, 0);
                 }
             }
         }
     });
+
+    // In synchronize mode the reorder buffer flushed each contiguous prefix as it
+    // formed; by the time the scope ends everything has been written in order.
+    debug_assert!(
+        !synchronize || order_state.lock().unwrap().pending.is_empty(),
+        "ordered tiling buffer left non-empty"
+    );
 
     // Flush.
     seg_writer.lock().unwrap().flush()?;
@@ -844,6 +906,7 @@ mod tests {
             true,
             8,
             1.0,
+            false,
         )
         .unwrap();
 

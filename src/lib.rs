@@ -78,6 +78,11 @@ pub fn cf_build(
     work_dir: Option<PathBuf>,
     #[builder(default = 128)] num_bins: usize,
     #[builder(default = 4.0)] memory_budget_gb: f64,
+    /// Emit the tiling in input-sequence order (off by default; see
+    /// [`Params::synchronize_output`]). Enable when a downstream consumer numbers
+    /// references by `.cf_seq` line order (e.g. salmon's contiguous decoy block).
+    #[builder(default = false)]
+    synchronize_output: bool,
 ) -> anyhow::Result<CfBuildResult> {
     let input_files = resolve_input_files(&input)?;
 
@@ -93,6 +98,7 @@ pub fn cf_build(
         true, // collate_in_mem
         num_bins,
         memory_budget_gb,
+        synchronize_output,
     )?;
 
     let pool = rayon::ThreadPoolBuilder::new()

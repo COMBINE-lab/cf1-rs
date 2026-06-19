@@ -29,6 +29,7 @@ fn main() -> anyhow::Result<()> {
             collate_in_mem,
             num_bins,
             memory_budget_gb,
+            synchronize_output,
         } => {
             let params = Params::from_build_args(
                 seq_file,
@@ -44,6 +45,7 @@ fn main() -> anyhow::Result<()> {
                 collate_in_mem,
                 num_bins,
                 memory_budget_gb,
+                synchronize_output,
             )?;
 
             info!(

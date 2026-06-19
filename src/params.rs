@@ -67,6 +67,13 @@ pub enum Commands {
         /// can be cached in RAM during construction)
         #[arg(long = "memory-budget", default_value = "4.0")]
         memory_budget_gb: f64,
+
+        /// Emit the tiling (`.cf_seq`) in input-sequence order rather than
+        /// task-completion order, so reference numbering is deterministic. Off by
+        /// default (faster); enable when a downstream tool numbers references by
+        /// tiling-line order.
+        #[arg(long = "synchronize-output")]
+        synchronize_output: bool,
     },
 }
 
@@ -83,6 +90,13 @@ pub struct Params {
     pub collate_in_mem: bool,
     pub num_bins: usize,
     pub memory_budget_bytes: usize,
+    /// Emit the `.cf_seq` tiling in input-sequence order rather than
+    /// task-completion order. Off by default (preserving the faster, unordered
+    /// output for general use); downstream consumers that number references by
+    /// `.cf_seq` line order — e.g. salmon, which needs decoys to stay contiguous —
+    /// enable it. Only the final tiling-line writes are ordered; unitig extraction
+    /// stays fully parallel.
+    pub synchronize_output: bool,
 }
 
 impl Params {
@@ -101,6 +115,7 @@ impl Params {
         collate_in_mem: bool,
         num_bins: usize,
         memory_budget_gb: f64,
+        synchronize_output: bool,
     ) -> anyhow::Result<Self> {
         let mut input_files = Vec::new();
 
@@ -145,6 +160,7 @@ impl Params {
             collate_in_mem,
             num_bins,
             memory_budget_gb,
+            synchronize_output,
         )
     }
 
@@ -163,6 +179,7 @@ impl Params {
         collate_in_mem: bool,
         num_bins: usize,
         memory_budget_gb: f64,
+        synchronize_output: bool,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             k % 2 == 1 && (1..=63).contains(&k),
@@ -193,6 +210,7 @@ impl Params {
             collate_in_mem,
             num_bins,
             memory_budget_bytes,
+            synchronize_output,
         })
     }
 

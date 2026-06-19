@@ -131,6 +131,7 @@ fn main() -> anyhow::Result<()> {
         false,
         num_bins,
         memory_budget_gb,
+        false, // synchronize_output
     )?;
 
     rayon::ThreadPoolBuilder::new()
