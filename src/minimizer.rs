@@ -129,7 +129,13 @@ fn count_minimizers_chunk(seq: &[u8], m: usize, w: usize, histogram: &[AtomicU64
         // N input loudly (this is the first phase to read the sequence, so it
         // fail-fasts before any later phase). `count`/packed-seq do not reliably
         // panic on N themselves.
-        if let Some(off) = seq.iter().position(|&b| crate::dna::is_placeholder(b)) {
+        if crate::dna::contains_non_acgt(seq) {
+            // Cheap vectorized check said yes; now find the offending offset (slow
+            // table scan, only on this rare error path) for an informative message.
+            let off = seq
+                .iter()
+                .position(|&b| crate::dna::is_placeholder(b))
+                .unwrap_or(0);
             panic!(
                 "input contains an ambiguous base ('{}') at offset {off} but poly-N-stretch \
                  handling is disabled; pass --poly-N-stretch (CLI) / enable poly_n_stretch \

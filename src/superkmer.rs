@@ -101,6 +101,7 @@ pub fn route_superkmers(
 }
 
 /// Route super k-mers from a sequence chunk to bin files.
+#[allow(clippy::too_many_arguments)]
 fn route_chunk(
     seq: &[u8],
     m: usize,

@@ -43,6 +43,21 @@ pub fn is_placeholder(b: u8) -> bool {
     IS_PLACEHOLDER[b as usize]
 }
 
+/// True iff `seq` contains any base outside `ACGTacgt`.
+///
+/// Faster than scanning with [`is_placeholder`] (a 256-entry table, which lowers
+/// to a per-byte gather the compiler can't vectorize): each byte is upper-cased
+/// with `& 0xDF` — which maps exactly the 8 bytes `ACGTacgt` (and no others) onto
+/// `{A,C,G,T}` — then tested against 4 constants. That's branchless integer work
+/// the compiler auto-vectorizes into wide SIMD compares. Use this for the boolean
+/// "does it contain N?" check; fall back to [`is_placeholder`] only to locate the
+/// offending position on the (rare) error path.
+#[inline]
+pub fn contains_non_acgt(seq: &[u8]) -> bool {
+    seq.iter()
+        .any(|&b| !matches!(b & 0xDF, b'A' | b'C' | b'G' | b'T'))
+}
+
 /// Invoke `f(seg_start, segment)` for each maximal run of non-placeholder
 /// (ACGT) bases of length `>= k`. Cuttlefish handles ambiguous (`N`) bases by
 /// splitting a sequence on them — no k-mer spans a placeholder — exactly as the
