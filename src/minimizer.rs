@@ -62,7 +62,7 @@ pub fn count_minimizer_histogram(
                     let budget = &budget;
 
                     s.spawn(move |_| {
-                        count_minimizers_chunk(&seq_owned, m, w, histogram);
+                        count_minimizers_chunk(&seq_owned, m, w, histogram, params.poly_n_stretch);
                         budget.release(seq_len);
                     });
                 } else {
@@ -77,7 +77,7 @@ pub fn count_minimizer_histogram(
                             let histogram = &histogram;
 
                             inner.spawn(move |_| {
-                                count_minimizers_chunk(chunk, m, w, histogram);
+                                count_minimizers_chunk(chunk, m, w, histogram, params.poly_n_stretch);
                             });
                             start += CHUNK_BASES;
                         }
@@ -100,13 +100,18 @@ pub fn count_minimizer_histogram(
     Ok(counts)
 }
 
-/// Count minimizers in a sequence chunk into the shared histogram. Splits on
-/// placeholder (`N`) bases so `simd_minimizers`/packed-seq only ever sees ACGT
-/// (it panics on other bytes); k-mers never span a placeholder.
-fn count_minimizers_chunk(seq: &[u8], m: usize, w: usize, histogram: &[AtomicU64]) {
-    let k = w + m - 1;
+/// Count minimizers in a sequence chunk into the shared histogram.
+///
+/// When `poly_n` is set, splits on placeholder (`N`) bases so
+/// `simd_minimizers`/packed-seq only ever sees ACGT (it panics on other bytes)
+/// and k-mers never span a placeholder. When `poly_n` is *not* set, the raw chunk
+/// is passed straight through — so an input containing `N` panics, exactly as
+/// before N handling was added. This keeps `poly_n_stretch` the single switch for
+/// N support: without it the output phase would silently drop the poly-N gaps and
+/// emit a tiling with wrong reference positions, so we fail loudly instead.
+fn count_minimizers_chunk(seq: &[u8], m: usize, w: usize, histogram: &[AtomicU64], poly_n: bool) {
     let mut positions: Vec<u32> = Vec::new();
-    crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
+    let mut count = |seg: &[u8]| {
         positions.clear();
         let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seg);
         let output = simd_minimizers::canonical_minimizers(m, w).run(ascii_seq, &mut positions);
@@ -114,7 +119,26 @@ fn count_minimizers_chunk(seq: &[u8], m: usize, w: usize, histogram: &[AtomicU64
             let bucket = bucket_hash(val);
             histogram[bucket].fetch_add(1, Ordering::Relaxed);
         }
-    });
+    };
+    if poly_n {
+        let k = w + m - 1;
+        crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| count(seg));
+    } else {
+        // N handling disabled: without it the output phase cannot represent poly-N
+        // gaps, so the tiling would carry silently-wrong reference positions. Reject
+        // N input loudly (this is the first phase to read the sequence, so it
+        // fail-fasts before any later phase). `count`/packed-seq do not reliably
+        // panic on N themselves.
+        if let Some(off) = seq.iter().position(|&b| crate::dna::is_placeholder(b)) {
+            panic!(
+                "input contains an ambiguous base ('{}') at offset {off} but poly-N-stretch \
+                 handling is disabled; pass --poly-N-stretch (CLI) / enable poly_n_stretch \
+                 (cf_build) to index sequences containing N",
+                seq[off] as char
+            );
+        }
+        count(seq);
+    }
 }
 
 /// Partition minimizers into bins based on the histogram.

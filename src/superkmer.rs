@@ -63,7 +63,7 @@ pub fn route_superkmers(
                     let budget = &budget;
 
                     s.spawn(move |_| {
-                        route_chunk(&seq_owned, m, w, k, num_bins, partitioning, writers);
+                        route_chunk(&seq_owned, m, w, k, num_bins, partitioning, writers, params.poly_n_stretch);
                         budget.release(seq_len);
                     });
                 } else {
@@ -80,7 +80,7 @@ pub fn route_superkmers(
                             let writers = &writers;
 
                             inner.spawn(move |_| {
-                                route_chunk(chunk, m, w, k, num_bins, partitioning, writers);
+                                route_chunk(chunk, m, w, k, num_bins, partitioning, writers, params.poly_n_stretch);
                             });
                             start += CHUNK_BASES;
                         }
@@ -109,53 +109,67 @@ fn route_chunk(
     num_bins: usize,
     partitioning: &Partitioning,
     writers: &[Mutex<BinWriter>],
+    poly_n: bool,
 ) {
     let mut positions: Vec<u32> = Vec::new();
     let mut skmer_positions: Vec<u32> = Vec::new();
     let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); num_bins];
     let mut pack_buf: Vec<u8> = Vec::new();
 
-    // Split on placeholder (`N`) bases so `simd_minimizers`/packed-seq only sees
-    // ACGT (it panics otherwise); a super k-mer never spans a placeholder. Only
-    // k-mer *content* is packed (positions are not stored), so each ACGT segment
-    // is processed independently with its own local positions — no global offset.
-    crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
-        positions.clear();
-        skmer_positions.clear();
-        let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seg);
-        let output = simd_minimizers::canonical_minimizers(m, w)
-            .super_kmers(&mut skmer_positions)
-            .run(ascii_seq, &mut positions);
+    // Route the super k-mers of one ACGT-only (sub)sequence. Only k-mer *content*
+    // is packed (positions are not stored), so each segment is processed
+    // independently with its own local positions — no global offset is needed.
+    let mut route_segment =
+        |seg: &[u8], positions: &mut Vec<u32>, skmer_positions: &mut Vec<u32>| {
+            positions.clear();
+            skmer_positions.clear();
+            let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seg);
+            let output = simd_minimizers::canonical_minimizers(m, w)
+                .super_kmers(skmer_positions)
+                .run(ascii_seq, positions);
 
-        let pos_vals: Vec<(u32, u64)> = output.pos_and_values_u64().collect();
-        let num_skmers = pos_vals.len();
+            let pos_vals: Vec<(u32, u64)> = output.pos_and_values_u64().collect();
+            let num_skmers = pos_vals.len();
 
-        for sk_idx in 0..num_skmers {
-            let start_kmer_pos = skmer_positions[sk_idx] as usize;
-            let end_kmer_pos = if sk_idx + 1 < num_skmers {
-                skmer_positions[sk_idx + 1] as usize
-            } else {
-                seg.len() - k + 1
-            };
+            for sk_idx in 0..num_skmers {
+                let start_kmer_pos = skmer_positions[sk_idx] as usize;
+                let end_kmer_pos = if sk_idx + 1 < num_skmers {
+                    skmer_positions[sk_idx + 1] as usize
+                } else {
+                    seg.len() - k + 1
+                };
 
-            if end_kmer_pos <= start_kmer_pos {
-                continue;
+                if end_kmer_pos <= start_kmer_pos {
+                    continue;
+                }
+
+                let seq_start = start_kmer_pos;
+                let seq_end = end_kmer_pos - 1 + k;
+
+                if seq_end > seg.len() {
+                    continue;
+                }
+
+                let subseq = &seg[seq_start..seq_end];
+                let hash = pos_vals[sk_idx].1;
+                let bin = partitioning.bin_for_minimizer(hash);
+
+                write_packed_segments(subseq, k, bin, &mut buffers, writers, &mut pack_buf);
             }
+        };
 
-            let seq_start = start_kmer_pos;
-            let seq_end = end_kmer_pos - 1 + k;
-
-            if seq_end > seg.len() {
-                continue;
-            }
-
-            let subseq = &seg[seq_start..seq_end];
-            let hash = pos_vals[sk_idx].1;
-            let bin = partitioning.bin_for_minimizer(hash);
-
-            write_packed_segments(subseq, k, bin, &mut buffers, writers, &mut pack_buf);
-        }
-    });
+    if poly_n {
+        // Split on placeholder (`N`) bases so packed-seq only sees ACGT (it panics
+        // otherwise); a super k-mer never spans a placeholder.
+        crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
+            route_segment(seg, &mut positions, &mut skmer_positions)
+        });
+    } else {
+        // No N handling requested: pass the raw chunk straight through. An input
+        // containing `N` panics here (packed-seq), as before — see the rationale in
+        // `minimizer::count_minimizers_chunk`.
+        route_segment(seq, &mut positions, &mut skmer_positions);
+    }
 
     flush_all_buffers(&mut buffers, writers);
 }
