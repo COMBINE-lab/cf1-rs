@@ -15,7 +15,7 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
 rayon = "1.11"
-needletail = "0.6"
+needletail = "0.7"
 ph = { version = "0.11", default-features = false, features = ["wyhash"] }
 simd-minimizers = "2.3"
 voracious_radix_sort = "1"
