@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "cf1-rs"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ahash",
  "anyhow",
