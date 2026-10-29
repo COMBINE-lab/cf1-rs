@@ -2,45 +2,40 @@ use crate::dna::Base;
 use crate::kmer::{Kmer, KmerBits};
 use crate::minimizer::Partitioning;
 use crate::superkmer::{bin_file_path, packed_superkmers};
-use ph::fmph::keyset::CachedKeySet;
+use dsi_progress_logger::no_logging;
+use lender::{FallibleLend, FallibleLender, FallibleLending};
 use rayon::prelude::*;
+use std::borrow::Borrow;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use sux::func::{PHastR, PHastRBuilder};
+use sux::utils::ToSig;
 use tracing::info;
 
-/// PHast+ (8-bit seeds, wrapped shifts): the in-memory MPHF.
-type PhastFunction = ph::phast::Function2<ph::seeds::Bits8, ph::phast::ShiftOnlyWrapped>;
-
-/// The MPHF backing [`Mphf`], chosen by construction regime.
+/// The MPHF: sux's PHastR with its default parameters (8-bit seeds, four
+/// layouts, slices of length 1024, expected bucket size 4.25; about 1.94
+/// bits per key).
 ///
 /// Phases 4 and 5 evaluate the MPHF once per k-mer *occurrence* in the input
 /// (on a transcriptome, several times the number of distinct k-mers), so
-/// evaluation speed dominates their running time. PHast+ answers almost every
-/// query with one seed read, where FMPH probes a bit array per level and then a
-/// rank structure — about twice the cache misses. Its construction needs every
-/// key in memory, though, so inputs too large for the in-memory regime keep
-/// FMPH, which can be built by streaming the keys from disk.
-enum MphfImpl {
-    Fmph(ph::fmph::Function),
-    Phast(PhastFunction),
-}
+/// evaluation speed bounds their running time: PHastR answers almost every
+/// query with a signature and a single seed read. It can be built either from
+/// a slice of keys in memory or from keys streamed once, keeping 16-byte
+/// per-key construction records in temporary files (offline mode), and both
+/// constructions build the same function.
+type Phf<const K: usize> = PHastR<KmerKey<K>>;
 
-/// Build the in-memory-regime MPHF over `keys`.
-fn build_phast<const K: usize>(keys: Vec<KmerKey<K>>) -> MphfImpl
-where
-    Kmer<K>: KmerBits,
-{
-    MphfImpl::Phast(PhastFunction::with_vec_p_threads_hash_sc(
-        keys,
-        &ph::phast::Params::new(
-            ph::seeds::Bits8,
-            ph::phast::bits_per_seed_to_100_bucket_size(8),
-        ),
-        rayon::current_num_threads(),
-        ph::BuildDefaultSeededHasher::default(),
-        ph::phast::ShiftOnlyWrapped,
-    ))
+/// Number of chunks each PHastR level is swept in.
+///
+/// The function PHastR builds depends on the number of sweep chunks, which by
+/// default is the size of the current rayon pool: fixing it makes the MPHF —
+/// and hence unitig ids — independent of the thread count and of the
+/// construction regime. A sweep uses at most this many threads.
+const SWEEP_CHUNKS: usize = 16;
+
+/// The PHastR builder used for every construction (see [`SWEEP_CHUNKS`]).
+fn phf_builder() -> PHastRBuilder {
+    PHastRBuilder::default().sweep_chunks(SWEEP_CHUNKS)
 }
 
 /// Global minimal perfect hash function over all canonical k-mers.
@@ -48,24 +43,20 @@ pub struct Mphf<const K: usize>
 where
     Kmer<K>: KmerBits,
 {
-    mphf: MphfImpl,
+    mphf: Phf<K>,
     total_kmers: u64,
-    _phantom: std::marker::PhantomData<Kmer<K>>,
 }
 
 impl<const K: usize> Mphf<K>
 where
     Kmer<K>: KmerBits,
 {
-    /// Build a global MPHF by reading canonical k-mers from all bin temp files.
+    /// Build a global MPHF over the distinct canonical k-mers of all bins.
     ///
-    /// Phase 3a: Each bin is deduplicated independently in parallel (canonical minimizers
-    /// guarantee no cross-bin duplicates). In the in-memory regime the deduplicated
-    /// k-mers stay in memory; otherwise they are written back to binary files.
-    ///
-    /// Phase 3b (streaming regime only): The MPHF is built by streaming k-mers from
-    /// the binary files using `CachedKeySet`, avoiding holding the entire keyset in
-    /// memory.
+    /// Each bin is deduplicated independently, in parallel waves of bins
+    /// (canonical minimizers guarantee no cross-bin duplicates); see
+    /// [`build_with_clone_threshold`](Self::build_with_clone_threshold) for
+    /// how the keys reach the MPHF construction.
     pub fn build(
         partitioning: &Partitioning,
         work_dir: &Path,
@@ -74,39 +65,31 @@ where
     where
         <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
     {
-        // clone_threshold=300M: good balance of speed and memory on genome-scale data.
-        // Keys surviving early MPHF levels are cached in RAM when count drops below this.
-        Self::build_with_clone_threshold(partitioning, work_dir, 300_000_000)
+        Self::build_with_clone_threshold(partitioning, work_dir, DEFAULT_CLONE_THRESHOLD)
     }
 
     /// Build MPHF with an explicit `clone_threshold`.
     ///
     /// ## Construction strategy
     ///
-    /// Two regimes, chosen automatically based on `total` vs `clone_threshold`:
+    /// Bins are deduplicated a wave of bins at a time. Two regimes, chosen by
+    /// the running total of distinct k-mers vs `clone_threshold`:
     ///
-    /// **In-memory** (`total <= clone_threshold`): All k-mers are read into a `Vec`
-    /// and a PHast+ function is built over them (see [`MphfImpl`] for why). Peak
-    /// RSS is dominated by the key Vec plus PHast's sorted level-0 hashes
-    /// (`total × 8` bytes each). Suitable when `total` fits comfortably in RAM.
+    /// **In-memory** (`total <= clone_threshold`): each wave's k-mers are
+    /// appended to one key vector, and PHastR is built over that slice,
+    /// computing key signatures in parallel. Peak RSS is the keys (8 or 16
+    /// bytes each) plus about 10–12 bytes per key of construction memory.
     ///
-    /// **Streaming** (`total > clone_threshold`): Keys are read from the consolidated
-    /// dedup file on every MPHF pass using a **SPMC iterator** (one dedicated I/O
-    /// thread reading 16 MB chunks, `N` rayon workers pulling from per-worker channels).
-    /// Once the surviving-key count after an early level drops below `clone_threshold`,
-    /// `ph`'s `CachedKeySet` clones the survivors into a Vec and subsequent levels run
-    /// in-memory. No `mmap` is used: RSS reflects actual heap usage, not mapped pages.
+    /// **Streaming** (`total > clone_threshold`): as soon as the threshold
+    /// would be exceeded, the keys gathered so far, the wave that overflowed
+    /// and then every later bin are streamed once into an offline PHastR
+    /// construction, which keeps its 16-byte per-key records in temporary
+    /// files in `work_dir` (about 16 bytes per key of disk) and needs well
+    /// under a byte per key of memory besides ~256 MiB of buffers. Streaming
+    /// is sequential, so later bins are deduplicated in the background, up to
+    /// one bin per thread ahead. The keys themselves never touch the disk.
     ///
-    /// ## Default threshold
-    ///
-    /// `build()` uses `clone_threshold = 300_000_000`. Benchmarks on a 2.5 B-key
-    /// human genome dataset (k=31, 4 threads) showed:
-    ///
-    /// | clone_threshold | time  | peak RSS |
-    /// |-----------------|-------|----------|
-    /// | 400 M           | 97 s  | 9.1 GB   |
-    /// | 300 M           | 130 s | 3.9 GB   |
-    /// | 250 M           | 130 s | 3.8 GB   |
+    /// Both regimes build the same function (see [`SWEEP_CHUNKS`]).
     pub fn build_with_clone_threshold(
         partitioning: &Partitioning,
         work_dir: &Path,
@@ -115,149 +98,96 @@ where
     where
         <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
     {
-        let num_bins = partitioning.num_bins();
-        info!("Reading canonical k-mers from {} bins", num_bins);
+        Self::build_from_bins(partitioning.num_bins(), work_dir, clone_threshold)
+    }
 
-        // Phase 3a: Dedup each bin's k-mers, a wave of bins at a time. While the
-        // running total of distinct k-mers stays within `clone_threshold` (the
-        // in-memory regime), each wave's k-mers are appended, in bin order, to
-        // one key vector that is handed to the MPHF build as is — so the keys
-        // never touch the disk and never exist twice. Should the total exceed
-        // the threshold, the keys gathered so far are written out per bin and
-        // every later bin goes straight to its file, for streaming.
+    /// [`build_with_clone_threshold`](Self::build_with_clone_threshold) on
+    /// the bin files `0..num_bins` of `work_dir`.
+    fn build_from_bins(
+        num_bins: usize,
+        work_dir: &Path,
+        clone_threshold: usize,
+    ) -> anyhow::Result<Self>
+    where
+        <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
+    {
+        info!("Reading canonical k-mers from {} bins", num_bins);
         info!(
             "P3a: RSS before dedup: current={} MB, peak={} MB",
             crate::pipeline::current_rss_mb(),
             crate::pipeline::peak_rss_mb()
         );
+
         // Reserves address space only: pages are committed as keys are written.
-        let mut keys: Option<Vec<KmerKey<K>>> = Some(Vec::with_capacity(clone_threshold));
+        let mut keys: Vec<KmerKey<K>> = Vec::with_capacity(clone_threshold);
         let mut per_bin_counts: Vec<usize> = Vec::with_capacity(num_bins);
         let bins: Vec<usize> = (0..num_bins).collect();
-        for wave in bins.chunks(2 * rayon::current_num_threads()) {
-            let deduped: Vec<_> = wave
-                .par_iter()
-                .map(|&bin| dedup_bin_kmers::<K>(&bin_file_path(work_dir, bin)))
-                .collect();
-            let wave_total: usize = deduped.iter().map(Vec::len).sum();
-            let first_bin = per_bin_counts.len();
+        let mut waves = bins.chunks(2 * rayon::current_num_threads());
+        let mut overflow = None;
+        for wave in waves.by_ref() {
+            let deduped = dedup_wave::<K>(work_dir, wave);
             per_bin_counts.extend(deduped.iter().map(Vec::len));
-
-            if let Some(kept) = &keys
-                && kept.len() + wave_total > clone_threshold
-            {
-                // Leaving the in-memory regime: write out the bins kept so far.
-                let mut rest = &kept[..];
-                for (bin, &count) in per_bin_counts[..first_bin].iter().enumerate() {
-                    let (bin_keys, tail) = rest.split_at(count);
-                    write_kmers::<K>(
-                        &dedup_file_path(work_dir, bin),
-                        bin_keys.iter().map(|key| key.0.bits),
-                    );
-                    rest = tail;
-                }
-                keys = None;
+            if keys.len() + deduped.iter().map(Vec::len).sum::<usize>() > clone_threshold {
+                overflow = Some(deduped);
+                break;
             }
-            match &mut keys {
-                Some(kept) => append_par(kept, &deduped),
-                None => wave.par_iter().zip(&deduped).for_each(|(&bin, kmers)| {
-                    write_kmers::<K>(&dedup_file_path(work_dir, bin), kmers.iter().copied())
-                }),
-            }
+            append_par(&mut keys, &deduped);
         }
 
-        let total: usize = per_bin_counts.iter().sum();
-        let max_bin = per_bin_counts.iter().max().unwrap_or(&0);
-        let min_bin = per_bin_counts.iter().min().unwrap_or(&0);
-        info!(
-            "Total {} distinct canonical k-mers across {} bins (per-bin: min={}, max={}, avg={})",
-            total,
-            num_bins,
-            min_bin,
-            max_bin,
-            total / num_bins.max(1)
-        );
-        info!(
-            "P3a: RSS after dedup: current={} MB, peak={} MB",
-            crate::pipeline::current_rss_mb(),
-            crate::pipeline::peak_rss_mb()
-        );
-
-        if let Some(keys) = keys {
-            // Small input: build PHast+ over the in-memory keys; its evaluation
-            // is what phases 4 and 5 are bound by (see `MphfImpl`).
+        let Some(first_wave) = overflow else {
+            log_dedup_totals(&per_bin_counts);
+            let total = keys.len();
             info!(
                 "Building global MPHF for {} distinct canonical k-mers (in-memory, threads={})",
                 total,
                 rayon::current_num_threads()
             );
-            let mphf = build_phast(keys);
+            let mphf = Phf::<K>::try_par_new_with_builder(&keys, phf_builder(), no_logging![])?;
             info!("MPHF construction complete");
             return Ok(Mphf {
                 mphf,
                 total_kmers: total as u64,
-                _phantom: std::marker::PhantomData,
             });
-        }
+        };
 
-        // Phase 3b: Consolidate per-bin dedup files into a single file for parallel streaming.
-        let consolidated_path = work_dir.join("cf1_dedup_all.bin");
-        {
-            let out_file = std::fs::File::create(&consolidated_path)?;
-            let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
-            for bin in 0..num_bins {
-                let bin_path = dedup_file_path(work_dir, bin);
-                if let Ok(mut f) = std::fs::File::open(&bin_path) {
-                    std::io::copy(&mut f, &mut writer)?;
-                }
-                let _ = std::fs::remove_file(&bin_path);
-            }
-            writer.flush()?;
-        }
-
+        // Streaming regime: stream the kept keys, the wave that overflowed
+        // and every later bin into an offline construction. Later bins are
+        // deduplicated in the background, a window of bins ahead of the one
+        // being streamed, as streaming is sequential.
         info!(
-            "P3b: RSS after consolidation: current={} MB, peak={} MB",
-            crate::pipeline::current_rss_mb(),
-            crate::pipeline::peak_rss_mb()
-        );
-
-        let storage_size = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>();
-        let mt = rayon::current_num_threads() > 1;
-
-        // Stream k-mers from disk via SPMC parallel iterator.
-        // CachedKeySet caches surviving keys once count drops below threshold.
-        info!(
-            "Building global MPHF for {} distinct canonical k-mers (streaming, clone_threshold={}, threads={})",
-            total,
+            "Building global MPHF by streaming distinct canonical k-mers (offline, clone_threshold={}, threads={})",
             clone_threshold,
             rayon::current_num_threads()
         );
-        let conf = ph::fmph::BuildConf {
-            relative_level_size: 200,
-            use_multiple_threads: mt,
-            ..Default::default()
+        let window = rayon::current_num_threads();
+        let mut first_wave = first_wave.into_iter();
+        let mut later =
+            BinPrefetcher::<K>::new(work_dir, waves.flatten().copied().collect(), window);
+        let lender = StreamingKeys::<K, _> {
+            kept: keys,
+            kept_pos: 0,
+            bin: Vec::new(),
+            pos: 0,
+            next_bin: || {
+                if let Some(bin) = first_wave.next() {
+                    // Keep at most `window` deduplicated bins in memory.
+                    later.prefetch(window.saturating_sub(first_wave.len()));
+                    return Some(bin);
+                }
+                let bin = later.next()?;
+                per_bin_counts.push(bin.len());
+                Some(bin)
+            },
+            cur: KmerKey(Kmer::default()),
         };
-        let consolidated = Arc::new(consolidated_path.clone());
-        let consolidated2 = Arc::clone(&consolidated);
-        let keys = CachedKeySet::dynamic_with_len(
-            (
-                move || KmerFileIterator::<K>::new(Arc::clone(&consolidated), storage_size),
-                move || KmerSpmcParIter::<K>::new(Arc::clone(&consolidated2), total, storage_size),
-            ),
-            total,
-            clone_threshold,
-        );
-        let mphf = MphfImpl::Fmph(ph::fmph::Function::with_conf(keys, conf));
-
+        let builder = phf_builder().offline(true).temp_dir(work_dir);
+        let mphf = Phf::<K>::try_new_with_builder(lender, builder, no_logging![])?;
+        log_dedup_totals(&per_bin_counts);
         info!("MPHF construction complete");
-
-        // Cleanup consolidated file.
-        std::fs::remove_file(&consolidated_path)?;
-
+        let total = mphf.len();
         Ok(Mphf {
             mphf,
             total_kmers: total as u64,
-            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -268,63 +198,40 @@ where
         total: usize,
         clone_threshold: usize,
     ) -> anyhow::Result<Self> {
-        let kmer_size = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>();
-        let storage_size = kmer_size;
-
-        let mt = rayon::current_num_threads() > 1;
-
+        let storage_size = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>();
         let mphf = if total <= clone_threshold {
             info!(
                 "Building global MPHF for {} distinct canonical k-mers (in-memory, threads={})",
                 total,
                 rayon::current_num_threads()
             );
-            build_phast(read_all_kmers::<K>(consolidated_path, storage_size))
+            let keys = read_all_kmers::<K>(consolidated_path, storage_size);
+            Phf::<K>::try_par_new_with_builder(&keys, phf_builder(), no_logging![])?
         } else {
             info!(
-                "Building global MPHF for {} distinct canonical k-mers (streaming, clone_threshold={}, threads={})",
+                "Building global MPHF for {} distinct canonical k-mers (streaming, offline, threads={})",
                 total,
-                clone_threshold,
                 rayon::current_num_threads()
             );
-            let conf = ph::fmph::BuildConf {
-                relative_level_size: 200,
-                use_multiple_threads: mt,
-                ..Default::default()
+            let dir = consolidated_path.parent().unwrap_or(Path::new("."));
+            let builder = phf_builder().offline(true).temp_dir(dir);
+            let lender = IterLender {
+                iter: KmerFileIterator::<K>::new(consolidated_path, storage_size),
+                cur: None,
             };
-            let consolidated = Arc::new(consolidated_path.to_path_buf());
-            let consolidated2 = Arc::clone(&consolidated);
-            let keys = CachedKeySet::dynamic_with_len(
-                (
-                    move || KmerFileIterator::<K>::new(Arc::clone(&consolidated), storage_size),
-                    move || {
-                        KmerSpmcParIter::<K>::new(Arc::clone(&consolidated2), total, storage_size)
-                    },
-                ),
-                total,
-                clone_threshold,
-            );
-            MphfImpl::Fmph(ph::fmph::Function::with_conf(keys, conf))
+            Phf::<K>::try_new_with_builder(lender, builder, no_logging![])?
         };
-
         info!("MPHF construction complete");
-
         Ok(Mphf {
             mphf,
             total_kmers: total as u64,
-            _phantom: std::marker::PhantomData,
         })
     }
 
     /// Look up the global hash index for a canonical k-mer.
-    // Always inlined: it sits in the per-k-mer loops of phases 4 and 5, and the
-    // dispatch on the MPHF kind would otherwise make it too big to inline there.
     #[inline(always)]
     pub fn hash(&self, canonical_kmer: &Kmer<K>) -> u64 {
-        match &self.mphf {
-            MphfImpl::Fmph(f) => f.get(&KmerKey(*canonical_kmer)).unwrap_or(0),
-            MphfImpl::Phast(f) => f.get(&KmerKey(*canonical_kmer)) as u64,
-        }
+        self.mphf.get(KmerKey(*canonical_kmer)) as u64
     }
 
     /// Get the bucket_id for a canonical k-mer (used for unitig IDs).
@@ -335,6 +242,197 @@ where
 
     pub fn total_kmers(&self) -> u64 {
         self.total_kmers
+    }
+}
+
+/// Default [`Mphf::build_with_clone_threshold`] threshold: up to this many
+/// distinct k-mers the MPHF is built in memory.
+pub const DEFAULT_CLONE_THRESHOLD: usize = 300_000_000;
+
+/// Deduplicate the bins of `wave` in parallel, returning each bin's sorted
+/// distinct canonical k-mers.
+fn dedup_wave<const K: usize>(
+    work_dir: &Path,
+    wave: &[usize],
+) -> Vec<Vec<<Kmer<K> as KmerBits>::Storage>>
+where
+    Kmer<K>: KmerBits,
+    <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
+{
+    wave.par_iter()
+        .map(|&bin| dedup_bin_kmers::<K>(&bin_file_path(work_dir, bin)))
+        .collect()
+}
+
+fn log_dedup_totals(per_bin_counts: &[usize]) {
+    let num_bins = per_bin_counts.len();
+    let total: usize = per_bin_counts.iter().sum();
+    info!(
+        "Total {} distinct canonical k-mers across {} bins (per-bin: min={}, max={}, avg={})",
+        total,
+        num_bins,
+        per_bin_counts.iter().min().unwrap_or(&0),
+        per_bin_counts.iter().max().unwrap_or(&0),
+        total / num_bins.max(1)
+    );
+    info!(
+        "P3a: RSS after dedup: current={} MB, peak={} MB",
+        crate::pipeline::current_rss_mb(),
+        crate::pipeline::peak_rss_mb()
+    );
+}
+
+/// Lends the keys of the streaming regime to PHastR: first the keys kept in
+/// memory (freed once lent), then those of each bin returned by `next_bin`.
+struct StreamingKeys<const K: usize, F>
+where
+    Kmer<K>: KmerBits,
+{
+    kept: Vec<KmerKey<K>>,
+    kept_pos: usize,
+    bin: Vec<<Kmer<K> as KmerBits>::Storage>,
+    pos: usize,
+    next_bin: F,
+    cur: KmerKey<K>,
+}
+
+impl<'lend, const K: usize, F> FallibleLending<'lend> for StreamingKeys<K, F>
+where
+    Kmer<K>: KmerBits,
+{
+    type Lend = &'lend KmerKey<K>;
+}
+
+impl<const K: usize, F> FallibleLender for StreamingKeys<K, F>
+where
+    Kmer<K>: KmerBits,
+    F: FnMut() -> Option<Vec<<Kmer<K> as KmerBits>::Storage>>,
+{
+    lender::check_covariance_fallible!();
+    type Error = std::convert::Infallible;
+
+    #[inline]
+    fn next(&mut self) -> Result<Option<FallibleLend<'_, Self>>, Self::Error> {
+        if let Some(&key) = self.kept.get(self.kept_pos) {
+            self.kept_pos += 1;
+            self.cur = key;
+            return Ok(Some(&self.cur));
+        }
+        if self.kept.capacity() != 0 {
+            self.kept = Vec::new();
+        }
+        loop {
+            if let Some(&bits) = self.bin.get(self.pos) {
+                self.pos += 1;
+                self.cur = KmerKey(Kmer { bits });
+                return Ok(Some(&self.cur));
+            }
+            // Free the exhausted bin before deduplicating the next one.
+            self.bin = Vec::new();
+            match (self.next_bin)() {
+                Some(bin) => {
+                    self.bin = bin;
+                    self.pos = 0;
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Deduplicates a sequence of bins in the background on the current rayon
+/// pool, keeping up to `window` bins in flight ahead of the one returned
+/// last, and returns them in order. Nothing is started before the first call
+/// to [`next`](Self::next) or [`prefetch`](Self::prefetch).
+struct BinPrefetcher<const K: usize>
+where
+    Kmer<K>: KmerBits,
+{
+    work_dir: PathBuf,
+    bins: Vec<usize>,
+    results: Vec<crossbeam_channel::Receiver<Vec<<Kmer<K> as KmerBits>::Storage>>>,
+    window: usize,
+    next: usize,
+}
+
+impl<const K: usize> BinPrefetcher<K>
+where
+    Kmer<K>: KmerBits,
+    <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
+{
+    fn new(work_dir: &Path, bins: Vec<usize>, window: usize) -> Self {
+        BinPrefetcher {
+            work_dir: work_dir.to_path_buf(),
+            bins,
+            results: Vec::new(),
+            window: window.max(1),
+            next: 0,
+        }
+    }
+
+    /// Starts deduplicating the next `ahead` bins, if not started yet.
+    fn prefetch(&mut self, ahead: usize) {
+        self.spawn_up_to(self.next + ahead);
+    }
+
+    /// Starts deduplicating the bins before position `end` not started yet.
+    fn spawn_up_to(&mut self, end: usize) {
+        while self.results.len() < end.min(self.bins.len()) {
+            let path = bin_file_path(&self.work_dir, self.bins[self.results.len()]);
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            rayon::spawn(move || {
+                // The receiver is gone only if construction was abandoned.
+                let _ = tx.send(dedup_bin_kmers::<K>(&path));
+            });
+            self.results.push(rx);
+        }
+    }
+
+    /// Returns the next bin's distinct canonical k-mers.
+    fn next(&mut self) -> Option<Vec<<Kmer<K> as KmerBits>::Storage>> {
+        if self.next == self.bins.len() {
+            return None;
+        }
+        self.spawn_up_to(self.next + 1 + self.window);
+        let rx = &self.results[self.next];
+        let bin = loop {
+            match rx.try_recv() {
+                Ok(bin) => break bin,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // Help the pool (with one thread, nothing else would
+                    // deduplicate the bin), or wait for it.
+                    if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    panic!("bin deduplication failed")
+                }
+            }
+        };
+        self.next += 1;
+        Some(bin)
+    }
+}
+
+/// Lends the keys of an iterator to PHastR.
+struct IterLender<I: Iterator> {
+    iter: I,
+    cur: Option<I::Item>,
+}
+
+impl<'lend, I: Iterator> FallibleLending<'lend> for IterLender<I> {
+    type Lend = &'lend I::Item;
+}
+
+impl<I: Iterator> FallibleLender for IterLender<I> {
+    lender::check_covariance_fallible!();
+    type Error = std::convert::Infallible;
+
+    #[inline]
+    fn next(&mut self) -> Result<Option<FallibleLend<'_, Self>>, Self::Error> {
+        self.cur = self.iter.next();
+        Ok(self.cur.as_ref())
     }
 }
 
@@ -360,11 +458,6 @@ impl RadixSortDedup for u128 {
         voracious_radix_sort::voracious_sort(vec, 8);
         vec.dedup();
     }
-}
-
-/// Path for a deduplicated k-mer binary file.
-fn dedup_file_path(work_dir: &Path, bin: usize) -> PathBuf {
-    work_dir.join(format!("cf1_dedup_{:05}.bin", bin))
 }
 
 /// Read a bin's packed super k-mers, extract and deduplicate canonical k-mers
@@ -473,27 +566,24 @@ fn write_kmers<const K: usize>(
     writer.flush().expect("Failed to flush dedup file");
 }
 
-/// Iterator that reads KmerKey<K> values from the consolidated binary file via BufReader.
+/// Iterator that reads KmerKey<K> values from a consolidated binary file via BufReader.
 struct KmerFileIterator<const K: usize>
 where
     Kmer<K>: KmerBits,
 {
     reader: std::io::BufReader<std::fs::File>,
     storage_size: usize,
-    _phantom: std::marker::PhantomData<Kmer<K>>,
 }
 
 impl<const K: usize> KmerFileIterator<K>
 where
     Kmer<K>: KmerBits,
 {
-    fn new(path: Arc<PathBuf>, storage_size: usize) -> Self {
-        let file =
-            std::fs::File::open(path.as_ref()).expect("Failed to open consolidated dedup file");
+    fn new(path: &Path, storage_size: usize) -> Self {
+        let file = std::fs::File::open(path).expect("Failed to open consolidated dedup file");
         KmerFileIterator {
             reader: std::io::BufReader::with_capacity(256 * 1024, file),
             storage_size,
-            _phantom: std::marker::PhantomData,
         }
     }
 }
@@ -527,262 +617,153 @@ fn read_all_kmers<const K: usize>(path: &Path, storage_size: usize) -> Vec<KmerK
 where
     Kmer<K>: KmerBits,
 {
-    use std::io::Read;
-    let file = std::fs::File::open(path).expect("Failed to open consolidated dedup file");
-    let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-    let expected = file_len / storage_size;
-    let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
-    let mut keys = Vec::with_capacity(expected);
-    loop {
-        let mut kmer = Kmer::<K>::default();
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                &mut kmer.bits as *mut <Kmer<K> as KmerBits>::Storage as *mut u8,
-                storage_size,
-            )
-        };
-        match reader.read_exact(bytes) {
-            Ok(()) => keys.push(KmerKey(kmer)),
-            Err(_) => break,
-        }
-    }
+    let file_len = std::fs::metadata(path)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
+    let mut keys = Vec::with_capacity(file_len / storage_size);
+    keys.extend(KmerFileIterator::<K>::new(path, storage_size));
     keys
 }
 
-// ── SPMC (Single-Producer, Multiple-Consumer) parallel iterator ──────────────
-//
-// Mirrors the C++ cuttlefish `Kmer_SPMC_Iterator` design:
-// - One background thread reads the consolidated file sequentially in 16 MB chunks
-// - Worker threads receive batches via per-worker bounded channels
-// - Zero per-element syscalls from worker threads
-// - No mmap — RSS reflects actual heap usage only
-
-/// 16 MB read chunks — matches C++ cuttlefish's BUF_SZ_PER_CONSUMER.
-const SPMC_CHUNK_BYTES: usize = 16 * 1024 * 1024;
-
-/// A batch of raw bytes from the producer, to be parsed into k-mers by a worker.
-/// Uses a pooled buffer to avoid allocation per batch.
-struct RawBatch {
-    buf: Vec<u8>,
-    valid: usize,
-}
-
-/// SPMC parallel iterator. Created fresh for each pass over the k-mers.
-struct KmerSpmcParIter<const K: usize>
-where
-    Kmer<K>: KmerBits,
-{
-    path: Arc<PathBuf>,
-    total: usize,
-    storage_size: usize,
-    _phantom: std::marker::PhantomData<Kmer<K>>,
-}
-
-impl<const K: usize> KmerSpmcParIter<K>
-where
-    Kmer<K>: KmerBits,
-{
-    fn new(path: Arc<PathBuf>, total: usize, storage_size: usize) -> Self {
-        KmerSpmcParIter {
-            path,
-            total,
-            storage_size,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<const K: usize> rayon::iter::ParallelIterator for KmerSpmcParIter<K>
-where
-    Kmer<K>: KmerBits,
-    KmerKey<K>: Send + Sync,
-{
-    type Item = KmerKey<K>;
-
-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
-    where
-        C: rayon::iter::plumbing::UnindexedConsumer<Self::Item>,
-    {
-        let num_workers = rayon::current_num_threads();
-        let storage_size = self.storage_size;
-
-        // Per-worker channels: producer sends RawBatch, workers receive.
-        // Bound of 2 gives double-buffering per worker.
-        let mut senders = Vec::with_capacity(num_workers);
-        let mut receivers = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let (tx, rx) = crossbeam_channel::bounded::<RawBatch>(2);
-            senders.push(tx);
-            receivers.push(rx);
-        }
-
-        // Return-path channel: workers send back empty buffers for reuse.
-        let (buf_return_tx, buf_return_rx) = crossbeam_channel::bounded::<Vec<u8>>(num_workers * 3);
-
-        // Pre-allocate buffer pool.
-        for _ in 0..num_workers * 3 {
-            let _ = buf_return_tx.send(vec![0u8; SPMC_CHUNK_BYTES]);
-        }
-
-        // Spawn producer thread (outside rayon pool — dedicated I/O thread).
-        let path = self.path.as_ref().clone();
-        let producer_handle = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut file = std::fs::File::open(&path)
-                .expect("SPMC producer: failed to open consolidated file");
-            let mut worker_idx = 0;
-
-            loop {
-                // Get a buffer from the pool (or allocate if pool exhausted).
-                let mut buf = buf_return_rx
-                    .recv()
-                    .unwrap_or_else(|_| vec![0u8; SPMC_CHUNK_BYTES]);
-
-                let max_bytes = (buf.len() / storage_size) * storage_size;
-                let mut total_read = 0;
-                while total_read < max_bytes {
-                    match file.read(&mut buf[total_read..max_bytes]) {
-                        Ok(0) => break,
-                        Ok(n) => total_read += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => panic!("SPMC producer: read error: {}", e),
-                    }
-                }
-                total_read = (total_read / storage_size) * storage_size;
-
-                if total_read == 0 {
-                    // EOF — drop all senders to signal workers.
-                    drop(senders);
-                    break;
-                }
-
-                let batch = RawBatch {
-                    buf,
-                    valid: total_read,
-                };
-                // Send to current worker; if channel is full, this blocks
-                // (backpressure from slow worker).
-                if senders[worker_idx].send(batch).is_err() {
-                    break; // Worker dropped — iteration was cut short.
-                }
-                worker_idx = (worker_idx + 1) % num_workers;
-            }
-        });
-
-        // Split the rayon consumer into per-worker sub-consumers, run workers
-        // in the rayon thread pool via `join` tree, then reduce results.
-        let result = spmc_drive_workers::<K, C>(
-            &receivers,
-            &buf_return_tx,
-            storage_size,
-            consumer,
-            0,
-            num_workers,
-        );
-
-        producer_handle
-            .join()
-            .expect("SPMC producer thread panicked");
-        result
-    }
-
-    fn opt_len(&self) -> Option<usize> {
-        Some(self.total)
-    }
-}
-
-/// Recursively split the rayon consumer and drive each worker.
-/// This builds a binary join-tree so rayon can parallelize the workers.
-fn spmc_drive_workers<const K: usize, C>(
-    receivers: &[crossbeam_channel::Receiver<RawBatch>],
-    buf_return: &crossbeam_channel::Sender<Vec<u8>>,
-    storage_size: usize,
-    consumer: C,
-    start: usize,
-    end: usize,
-) -> C::Result
-where
-    Kmer<K>: KmerBits,
-    KmerKey<K>: Send + Sync,
-    C: rayon::iter::plumbing::UnindexedConsumer<KmerKey<K>>,
-{
-    use rayon::iter::plumbing::*;
-
-    if end - start == 1 {
-        // Leaf: this worker pulls batches from its channel and feeds the folder.
-        let mut folder = consumer.into_folder();
-        let rx = &receivers[start];
-        while let Ok(batch) = rx.recv() {
-            let buf = &batch.buf[..batch.valid];
-            let mut pos = 0;
-            while pos + storage_size <= batch.valid {
-                let mut kmer = Kmer::<K>::default();
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        &mut kmer.bits as *mut <Kmer<K> as KmerBits>::Storage as *mut u8,
-                        storage_size,
-                    )
-                };
-                dst.copy_from_slice(&buf[pos..pos + storage_size]);
-                pos += storage_size;
-                folder = folder.consume(KmerKey(kmer));
-                if folder.full() {
-                    // Return the buffer and stop.
-                    let _ = buf_return.send(batch.buf);
-                    return folder.complete();
-                }
-            }
-            // Return buffer to pool for reuse.
-            let _ = buf_return.send(batch.buf);
-        }
-        folder.complete()
-    } else {
-        // Internal node: split consumer and recurse with rayon::join.
-        let mid = start + (end - start) / 2;
-        let (left_consumer, right_consumer, reducer) = consumer.split_at(mid - start);
-        let (left, right) = rayon::join(
-            || {
-                spmc_drive_workers::<K, _>(
-                    receivers,
-                    buf_return,
-                    storage_size,
-                    left_consumer,
-                    start,
-                    mid,
-                )
-            },
-            || {
-                spmc_drive_workers::<K, _>(
-                    receivers,
-                    buf_return,
-                    storage_size,
-                    right_consumer,
-                    mid,
-                    end,
-                )
-            },
-        );
-        reducer.reduce(left, right)
-    }
-}
-
-/// Wrapper to implement Hash for Kmer in the context of MPHF.
+/// A canonical k-mer as an MPHF key.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KmerKey<const K: usize>(pub(crate) Kmer<K>)
 where
     Kmer<K>: KmerBits;
 
-use std::hash::{Hash, Hasher};
-
-impl<const K: usize> Hash for KmerKey<K>
+impl<const K: usize> ToSig<[u64; 1]> for KmerKey<K>
 where
     Kmer<K>: KmerBits,
 {
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        // Use the Storage type's native Hash impl (write_u64 for u64, write_u128 for u128).
-        // This is more efficient than going through bytes and works better with
-        // the MPHF's seeded hash family.
-        self.0.bits.hash(state);
+    /// Seeded rapidhash v3 (a stable hash) of the k-mer's native-endian
+    /// storage bytes, whose length is a constant of the k-mer type.
+    #[inline(always)]
+    fn to_sig(key: impl Borrow<Self>, seed: u64) -> [u64; 1] {
+        use rapidhash::v3::{RapidSecrets, rapidhash_v3_inline};
+        // Queries hash with the function's seed, zero: skip deriving its
+        // secrets at every query.
+        const SEED0: RapidSecrets = RapidSecrets::seed_cpp(0);
+        let secrets = if seed == 0 {
+            SEED0
+        } else {
+            RapidSecrets::seed_cpp(seed)
+        };
+        let bits = &key.borrow().0.bits;
+        [rapidhash_v3_inline::<true, false, false>(
+            <Kmer<K> as KmerBits>::as_bytes(bits),
+            &secrets,
+        )]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A tiny deterministic generator (xorshift64*).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    /// Writes `num_bins` bin files of random super k-mers to a fresh
+    /// directory. Super k-mers repeat within a bin, so that deduplication
+    /// matters, but not across bins (as with minimizer partitioning).
+    fn write_bins(dir: &Path, num_bins: usize, seed: u64) {
+        let mut rng = Rng(seed);
+        for bin in 0..num_bins {
+            let mut pool: Vec<Vec<u8>> = vec![];
+            let mut data = vec![];
+            for _ in 0..200 {
+                let bases: Vec<u8> = if !pool.is_empty() && rng.next().is_multiple_of(4) {
+                    pool[(rng.next() % pool.len() as u64) as usize].clone()
+                } else {
+                    let len = 20 + (rng.next() % 120) as usize;
+                    (0..len).map(|_| (rng.next() & 3) as u8).collect()
+                };
+                data.extend_from_slice(&(bases.len() as u16).to_le_bytes());
+                for chunk in bases.chunks(4) {
+                    let mut byte = 0u8;
+                    for (i, &b) in chunk.iter().enumerate() {
+                        byte |= b << (6 - 2 * i);
+                    }
+                    data.push(byte);
+                }
+                pool.push(bases);
+            }
+            std::fs::write(bin_file_path(dir, bin), data).unwrap();
+        }
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cf1-mphf-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every construction regime and thread count builds the same minimal
+    /// perfect hash function on the distinct canonical k-mers of the bins.
+    fn check_regimes<const K: usize>(name: &str)
+    where
+        Kmer<K>: KmerBits,
+        <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
+    {
+        let num_bins = 13;
+        let dir = scratch_dir(name);
+        write_bins(&dir, num_bins, 0x9E37_79B9_7F4A_7C15 ^ K as u64);
+        let keys: Vec<Kmer<K>> = (0..num_bins)
+            .flat_map(|bin| dedup_bin_kmers::<K>(&bin_file_path(&dir, bin)))
+            .map(|bits| Kmer { bits })
+            .collect();
+        let n = keys.len();
+        assert!(n > 10_000, "too few keys ({n})");
+
+        let mut reference: Option<Vec<u64>> = None;
+        // In memory; streaming from the start; streaming after keeping some
+        // waves in memory.
+        for threshold in [n, 0, n / 3] {
+            for threads in [1, 2, 5] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let mphf = pool
+                    .install(|| Mphf::<K>::build_from_bins(num_bins, &dir, threshold))
+                    .unwrap();
+                assert_eq!(mphf.total_kmers() as usize, n);
+                let values: Vec<u64> = keys.iter().map(|k| mphf.hash(k)).collect();
+                let distinct: HashSet<u64> = values.iter().copied().collect();
+                assert_eq!(distinct.len(), n, "not injective");
+                assert!(values.iter().all(|&v| (v as usize) < n), "not minimal");
+                match &reference {
+                    None => reference = Some(values),
+                    Some(r) => assert!(
+                        r == &values,
+                        "threshold {threshold}, {threads} threads: different function"
+                    ),
+                }
+            }
+        }
+        // Offline construction leaves no files behind besides the bins.
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(files, num_bins);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn regimes_build_the_same_function_u64() {
+        check_regimes::<31>("k31");
+    }
+
+    #[test]
+    fn regimes_build_the_same_function_u128() {
+        check_regimes::<63>("k63");
     }
 }
