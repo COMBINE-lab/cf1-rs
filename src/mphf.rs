@@ -7,7 +7,6 @@ use rayon::prelude::*;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
 
 /// PHast+ (8-bit seeds, wrapped shifts): the in-memory MPHF.
@@ -119,31 +118,53 @@ where
         let num_bins = partitioning.num_bins();
         info!("Reading canonical k-mers from {} bins", num_bins);
 
-        // Phase 3a: Dedup each bin's k-mers. While the running total of distinct
-        // k-mers stays within `clone_threshold` (the in-memory regime), a bin's
-        // k-mers are kept in memory; beyond it they are written to a binary file
-        // for streaming. Totals only grow, so if the final total is within the
-        // threshold every bin was kept, and the keys never touch the disk.
+        // Phase 3a: Dedup each bin's k-mers, a wave of bins at a time. While the
+        // running total of distinct k-mers stays within `clone_threshold` (the
+        // in-memory regime), each wave's k-mers are appended, in bin order, to
+        // one key vector that is handed to the MPHF build as is — so the keys
+        // never touch the disk and never exist twice. Should the total exceed
+        // the threshold, the keys gathered so far are written out per bin and
+        // every later bin goes straight to its file, for streaming.
         info!(
             "P3a: RSS before dedup: current={} MB, peak={} MB",
             crate::pipeline::current_rss_mb(),
             crate::pipeline::peak_rss_mb()
         );
-        let running_total = AtomicUsize::new(0);
-        let bins: Vec<DedupedBin<K>> = (0..num_bins)
-            .into_par_iter()
-            .map(|bin| {
-                let kmers = dedup_bin_kmers::<K>(&bin_file_path(work_dir, bin));
-                let count = kmers.len();
-                if running_total.fetch_add(count, Ordering::Relaxed) + count <= clone_threshold {
-                    DedupedBin::InMemory(kmers)
-                } else {
-                    write_kmers::<K>(&dedup_file_path(work_dir, bin), &kmers);
-                    DedupedBin::OnDisk(count)
+        // Reserves address space only: pages are committed as keys are written.
+        let mut keys: Option<Vec<KmerKey<K>>> = Some(Vec::with_capacity(clone_threshold));
+        let mut per_bin_counts: Vec<usize> = Vec::with_capacity(num_bins);
+        let bins: Vec<usize> = (0..num_bins).collect();
+        for wave in bins.chunks(2 * rayon::current_num_threads()) {
+            let deduped: Vec<_> = wave
+                .par_iter()
+                .map(|&bin| dedup_bin_kmers::<K>(&bin_file_path(work_dir, bin)))
+                .collect();
+            let wave_total: usize = deduped.iter().map(Vec::len).sum();
+            let first_bin = per_bin_counts.len();
+            per_bin_counts.extend(deduped.iter().map(Vec::len));
+
+            if let Some(kept) = &keys
+                && kept.len() + wave_total > clone_threshold
+            {
+                // Leaving the in-memory regime: write out the bins kept so far.
+                let mut rest = &kept[..];
+                for (bin, &count) in per_bin_counts[..first_bin].iter().enumerate() {
+                    let (bin_keys, tail) = rest.split_at(count);
+                    write_kmers::<K>(
+                        &dedup_file_path(work_dir, bin),
+                        bin_keys.iter().map(|key| key.0.bits),
+                    );
+                    rest = tail;
                 }
-            })
-            .collect();
-        let per_bin_counts: Vec<usize> = bins.iter().map(DedupedBin::len).collect();
+                keys = None;
+            }
+            match &mut keys {
+                Some(kept) => append_par(kept, &deduped),
+                None => wave.par_iter().zip(&deduped).for_each(|(&bin, kmers)| {
+                    write_kmers::<K>(&dedup_file_path(work_dir, bin), kmers.iter().copied())
+                }),
+            }
+        }
 
         let total: usize = per_bin_counts.iter().sum();
         let max_bin = per_bin_counts.iter().max().unwrap_or(&0);
@@ -162,23 +183,14 @@ where
             crate::pipeline::peak_rss_mb()
         );
 
-        if total <= clone_threshold {
-            // Small input: gather the keys in memory and build PHast+, whose
-            // evaluation is what phases 4 and 5 are bound by (see `MphfImpl`).
+        if let Some(keys) = keys {
+            // Small input: build PHast+ over the in-memory keys; its evaluation
+            // is what phases 4 and 5 are bound by (see `MphfImpl`).
             info!(
                 "Building global MPHF for {} distinct canonical k-mers (in-memory, threads={})",
                 total,
                 rayon::current_num_threads()
             );
-            let mut keys = Vec::with_capacity(total);
-            for bin in bins {
-                match bin {
-                    DedupedBin::InMemory(kmers) => {
-                        keys.extend(kmers.into_iter().map(|bits| KmerKey(Kmer { bits })));
-                    }
-                    DedupedBin::OnDisk(_) => unreachable!("bin spilled within the threshold"),
-                }
-            }
             let mphf = build_phast(keys);
             info!("MPHF construction complete");
             return Ok(Mphf {
@@ -187,13 +199,6 @@ where
                 _phantom: std::marker::PhantomData,
             });
         }
-
-        // Large input: spill the bins still in memory, so every bin has a file.
-        bins.into_par_iter().enumerate().for_each(|(bin, deduped)| {
-            if let DedupedBin::InMemory(kmers) = deduped {
-                write_kmers::<K>(&dedup_file_path(work_dir, bin), &kmers);
-            }
-        });
 
         // Phase 3b: Consolidate per-bin dedup files into a single file for parallel streaming.
         let consolidated_path = work_dir.join("cf1_dedup_all.bin");
@@ -379,30 +384,34 @@ where
     <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
 {
     let kmers = dedup_bin_kmers::<K>(src);
-    write_kmers::<K>(dst, &kmers);
+    write_kmers::<K>(dst, kmers.iter().copied());
     kmers.len()
 }
 
-/// A bin's distinct canonical k-mers, kept in memory or already written to the
-/// bin's dedup file.
-enum DedupedBin<const K: usize>
-where
+/// Append the k-mers of `parts` to `keys` in order, copying the parts in
+/// parallel. `keys` must already have the capacity.
+fn append_par<const K: usize>(
+    keys: &mut Vec<KmerKey<K>>,
+    parts: &[Vec<<Kmer<K> as KmerBits>::Storage>],
+) where
     Kmer<K>: KmerBits,
 {
-    InMemory(Vec<<Kmer<K> as KmerBits>::Storage>),
-    OnDisk(usize),
-}
-
-impl<const K: usize> DedupedBin<K>
-where
-    Kmer<K>: KmerBits,
-{
-    fn len(&self) -> usize {
-        match self {
-            DedupedBin::InMemory(kmers) => kmers.len(),
-            DedupedBin::OnDisk(count) => *count,
-        }
+    let added: usize = parts.iter().map(Vec::len).sum();
+    assert!(keys.capacity() - keys.len() >= added, "key vector capacity");
+    let mut spare = &mut keys.spare_capacity_mut()[..added];
+    let mut slots = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (slot, rest) = spare.split_at_mut(part.len());
+        slots.push(slot);
+        spare = rest;
     }
+    slots.into_par_iter().zip(parts).for_each(|(slot, part)| {
+        for (dst, &bits) in slot.iter_mut().zip(part) {
+            dst.write(KmerKey(Kmer { bits }));
+        }
+    });
+    // SAFETY: the `added` slots after the current length were all written above.
+    unsafe { keys.set_len(keys.len() + added) };
 }
 
 /// Read a bin's packed super k-mers and return its distinct canonical k-mers,
@@ -446,15 +455,17 @@ where
 }
 
 /// Write k-mers to `dst` as raw binary (native endian Storage bytes).
-fn write_kmers<const K: usize>(dst: &Path, kmers: &[<Kmer<K> as KmerBits>::Storage])
-where
+fn write_kmers<const K: usize>(
+    dst: &Path,
+    kmers: impl IntoIterator<Item = <Kmer<K> as KmerBits>::Storage>,
+) where
     Kmer<K>: KmerBits,
 {
     let storage_size = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>();
     let file = std::fs::File::create(dst).expect("Failed to create dedup file");
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
     for val in kmers {
-        let bytes = <Kmer<K> as KmerBits>::as_bytes(val);
+        let bytes = <Kmer<K> as KmerBits>::as_bytes(&val);
         writer
             .write_all(&bytes[..storage_size])
             .expect("Failed to write k-mer");
