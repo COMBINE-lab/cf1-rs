@@ -12,6 +12,10 @@ use std::sync::Mutex;
 /// Keeps per-thread working set small for better allocator page reuse.
 const CHUNK_KMERS: usize = 4_000_000;
 
+/// Number of consecutive k-mers whose MPHF lookups are issued together in
+/// [`Classifier::process_contiguous_subseq`].
+const LOOKUP_BATCH: usize = 32;
+
 /// Classifier: performs Phase 4 DFA classification.
 /// Exact port of CdBG_Builder.cpp.
 pub struct Classifier<'a, const K: usize>
@@ -60,8 +64,18 @@ where
         right_end + 1
     }
 
-    /// Process a contiguous subsequence starting at start_idx.
-    /// Returns the non-inclusive ending index.
+    /// Process the contiguous run of valid k-mers starting at `start_idx`: every
+    /// k-mer up to the first one whose right neighbor is a placeholder (or the
+    /// sequence end), or up to `right_end`, whichever comes first.
+    /// Returns the non-inclusive ending index (last k-mer index + `K`).
+    ///
+    /// A k-mer's update depends only on its own state and its neighbors in the
+    /// sequence, never on the update of the k-mer before it, so the run is handled
+    /// in batches of [`LOOKUP_BATCH`]: every k-mer of a batch is first rolled and
+    /// resolved through the MPHF (independent lookups the core can overlap, with
+    /// their state words prefetched), then the DFA updates are applied in
+    /// sequence order. Interleaving each lookup with its dependent CAS loop
+    /// instead leaves the core waiting on roughly one cache miss at a time.
     fn process_contiguous_subseq(
         &self,
         seq: &[u8],
@@ -69,84 +83,73 @@ where
         right_end: usize,
         start_idx: usize,
     ) -> usize {
-        let mut kmer_idx = start_idx;
-        let mut curr_kmer = DirectedKmer::<K>::new(Kmer::<K>::from_ascii(seq, kmer_idx));
+        let mut last = start_idx;
+        while last < right_end && !is_placeholder(seq[last + K]) {
+            last += 1;
+        }
+        let has_left_first = start_idx > 0 && !is_placeholder(seq[start_idx - 1]);
 
-        // Check if isolated k-mer.
-        let no_left = kmer_idx == 0 || is_placeholder(seq[kmer_idx - 1]);
-        let no_right = kmer_idx + K == seq_len || is_placeholder(seq[kmer_idx + K]);
-
-        if no_left && no_right {
-            while !self.process_isolated_kmer(&curr_kmer) {}
-        } else {
-            // No valid right neighbor.
-            if no_right {
-                while !self.process_rightmost_kmer(&curr_kmer, seq[kmer_idx - 1]) {}
-                return kmer_idx + K;
+        let first = DirectedKmer::<K>::new(Kmer::<K>::from_ascii(seq, start_idx));
+        // kmers[i] is the k-mer at `pos + i`; kmers[n] its successor, if any.
+        let mut kmers = [first; LOOKUP_BATCH + 1];
+        let mut idxs = [0usize; LOOKUP_BATCH];
+        let mut pos = start_idx;
+        while pos <= last {
+            let n = (last - pos + 1).min(LOOKUP_BATCH);
+            for i in 1..n {
+                kmers[i] = kmers[i - 1];
+                kmers[i].roll_to_next_kmer(seq[pos + i - 1 + K]);
+            }
+            // Inside the run every k-mer but `last` has a right neighbor; `last`
+            // has one only when the run was cut at `right_end` (chunk boundary).
+            let tail = pos + n - 1;
+            let next_exists = tail < last || (tail + K < seq_len && !is_placeholder(seq[tail + K]));
+            if next_exists {
+                kmers[n] = kmers[n - 1];
+                kmers[n].roll_to_next_kmer(seq[tail + K]);
+            }
+            for (idx, kmer) in idxs[..n].iter_mut().zip(&kmers[..n]) {
+                *idx = self.mphf.hash(kmer.canonical()) as usize;
+                self.states.prefetch(*idx);
             }
 
-            // A valid right neighbor exists.
-            let mut next_kmer = curr_kmer;
-            next_kmer.roll_to_next_kmer(seq[kmer_idx + K]);
-
-            // No valid left neighbor.
-            if no_left {
-                while !self.process_leftmost_kmer(&curr_kmer, &next_kmer, seq[kmer_idx + K]) {}
-            } else {
-                while !self.process_internal_kmer(
-                    &curr_kmer,
-                    &next_kmer,
-                    seq[kmer_idx - 1],
-                    seq[kmer_idx + K],
-                ) {}
-            }
-
-            // Process internal k-mers.
-            kmer_idx += 1;
-            while kmer_idx < right_end && !is_placeholder(seq[kmer_idx + K]) {
-                curr_kmer = next_kmer;
-                next_kmer.roll_to_next_kmer(seq[kmer_idx + K]);
-
-                while !self.process_internal_kmer(
-                    &curr_kmer,
-                    &next_kmer,
-                    seq[kmer_idx - 1],
-                    seq[kmer_idx + K],
-                ) {}
-
-                kmer_idx += 1;
-            }
-
-            // Process rightmost k-mer.
-            if kmer_idx <= right_end {
-                curr_kmer = next_kmer;
-
-                if kmer_idx + K == seq_len || is_placeholder(seq[kmer_idx + K]) {
-                    while !self.process_rightmost_kmer(&curr_kmer, seq[kmer_idx - 1]) {}
-                } else {
-                    next_kmer.roll_to_next_kmer(seq[kmer_idx + K]);
-                    while !self.process_internal_kmer(
-                        &curr_kmer,
-                        &next_kmer,
-                        seq[kmer_idx - 1],
-                        seq[kmer_idx + K],
-                    ) {}
+            for i in 0..n {
+                let p = pos + i;
+                let idx = idxs[i];
+                let kmer = &kmers[i];
+                let has_left = p > start_idx || has_left_first;
+                let has_right = i + 1 < n || next_exists;
+                match (has_left, has_right) {
+                    (false, false) => while !self.process_isolated_kmer(idx) {},
+                    (true, false) => while !self.process_rightmost_kmer(idx, kmer, seq[p - 1]) {},
+                    (false, true) => {
+                        while !self.process_leftmost_kmer(idx, kmer, &kmers[i + 1], seq[p + K]) {}
+                    }
+                    (true, true) => {
+                        while !self.process_internal_kmer(
+                            idx,
+                            kmer,
+                            &kmers[i + 1],
+                            seq[p - 1],
+                            seq[p + K],
+                        ) {}
+                    }
                 }
-            } else {
-                kmer_idx -= 1;
             }
+
+            // Read only when the loop continues, in which case it was rolled.
+            kmers[0] = kmers[n];
+            pos += n;
         }
 
-        kmer_idx + K
+        last + K
     }
 
     fn is_self_loop(&self, kmer_hat: &Kmer<K>, next_kmer_hat: &Kmer<K>) -> bool {
         kmer_hat == next_kmer_hat
     }
 
-    fn process_isolated_kmer(&self, kmer: &DirectedKmer<K>) -> bool {
-        let kmer_hat = kmer.canonical();
-        let idx = self.mphf.hash(kmer_hat) as usize;
+    fn process_isolated_kmer(&self, idx: usize) -> bool {
         let state = self.states.get(idx);
 
         if state.is_dead_end() {
@@ -159,25 +162,25 @@ where
 
     fn process_loop(
         &self,
+        idx: usize,
         kmer: &DirectedKmer<K>,
         next_kmer: &DirectedKmer<K>,
         prev_char: u8, // 0 means leftmost (no prev)
     ) -> bool {
         // Leftmost (no prev_char) OR direct repeat -> MIMO.
         if prev_char == 0 || kmer.kmer() == next_kmer.kmer() {
-            let kmer_hat = kmer.canonical();
-            let idx = self.mphf.hash(kmer_hat) as usize;
             let state = self.states.get(idx);
             let new_state = State::from_vertex(&Vertex::mimo());
             return self.states.compare_and_swap(idx, state, new_state);
         }
 
         // Inverted repeat: treat as rightmost.
-        self.process_rightmost_kmer(kmer, prev_char)
+        self.process_rightmost_kmer(idx, kmer, prev_char)
     }
 
     fn process_leftmost_kmer(
         &self,
+        idx: usize,
         kmer: &DirectedKmer<K>,
         next_kmer: &DirectedKmer<K>,
         next_char: u8,
@@ -185,7 +188,6 @@ where
         let kmer_hat = kmer.canonical();
         let dir = kmer.dir();
         let next_kmer_hat = next_kmer.canonical();
-        let idx = self.mphf.hash(kmer_hat) as usize;
         let state = self.states.get(idx);
 
         if state.is_dead_end() {
@@ -193,7 +195,7 @@ where
         }
 
         if self.is_self_loop(kmer_hat, next_kmer_hat) {
-            return self.process_loop(kmer, next_kmer, 0);
+            return self.process_loop(idx, kmer, next_kmer, 0);
         }
 
         let old_state = state;
@@ -284,10 +286,8 @@ where
         }
     }
 
-    fn process_rightmost_kmer(&self, kmer: &DirectedKmer<K>, prev_char: u8) -> bool {
-        let kmer_hat = kmer.canonical();
+    fn process_rightmost_kmer(&self, idx: usize, kmer: &DirectedKmer<K>, prev_char: u8) -> bool {
         let dir = kmer.dir();
-        let idx = self.mphf.hash(kmer_hat) as usize;
         let state = self.states.get(idx);
 
         if state.is_dead_end() {
@@ -384,6 +384,7 @@ where
 
     fn process_internal_kmer(
         &self,
+        idx: usize,
         kmer: &DirectedKmer<K>,
         next_kmer: &DirectedKmer<K>,
         prev_char: u8,
@@ -392,7 +393,6 @@ where
         let kmer_hat = kmer.canonical();
         let dir = kmer.dir();
         let next_kmer_hat = next_kmer.canonical();
-        let idx = self.mphf.hash(kmer_hat) as usize;
         let state = self.states.get(idx);
 
         if state.is_dead_end() {
@@ -400,7 +400,7 @@ where
         }
 
         if self.is_self_loop(kmer_hat, next_kmer_hat) {
-            return self.process_loop(kmer, next_kmer, prev_char);
+            return self.process_loop(idx, kmer, next_kmer, prev_char);
         }
 
         let old_state = state;

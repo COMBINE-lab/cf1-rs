@@ -1,5 +1,5 @@
 use crate::budget::InFlightBudget;
-use crate::directed_kmer::{AnnotatedKmer, Direction, FWD};
+use crate::directed_kmer::{AnnotatedKmer, AnnotatedRun, Direction, FWD};
 use crate::dna::{complement_char, is_placeholder, to_upper};
 use crate::kmer::{Kmer, KmerBits};
 use crate::mphf::Mphf;
@@ -586,8 +586,8 @@ where
 {
     let mut kmer_idx = start_idx;
 
-    let mut curr_kmer =
-        AnnotatedKmer::<K>::new(Kmer::<K>::from_ascii(seq, kmer_idx), kmer_idx, mphf, states);
+    let mut run = AnnotatedRun::<K>::new(seq, kmer_idx, mphf, states);
+    let mut curr_kmer = run.next_kmer();
 
     // Isolated k-mer.
     let no_left = kmer_idx == 0 || is_placeholder(seq[kmer_idx - 1]);
@@ -595,14 +595,13 @@ where
 
     if no_left && no_right {
         output_gfa_unitig::<K>(
-            seq, &curr_kmer, &curr_kmer, mphf, states, seg_writer, seg_buf, k, unitigs, meta,
+            seq, &curr_kmer, &curr_kmer, states, seg_writer, seg_buf, k, unitigs, meta,
         );
     } else {
         if no_right {
             if no_left {
                 output_gfa_unitig::<K>(
-                    seq, &curr_kmer, &curr_kmer, mphf, states, seg_writer, seg_buf, k, unitigs,
-                    meta,
+                    seq, &curr_kmer, &curr_kmer, states, seg_writer, seg_buf, k, unitigs, meta,
                 );
             } else {
                 let prev_kmer = AnnotatedKmer::<K>::new(
@@ -618,16 +617,14 @@ where
                     prev_kmer.dir(),
                 ) {
                     output_gfa_unitig::<K>(
-                        seq, &curr_kmer, &curr_kmer, mphf, states, seg_writer, seg_buf, k, unitigs,
-                        meta,
+                        seq, &curr_kmer, &curr_kmer, states, seg_writer, seg_buf, k, unitigs, meta,
                     );
                 }
             }
             return kmer_idx + K;
         }
 
-        let mut next_kmer = curr_kmer;
-        next_kmer.roll_to_next_kmer(seq[kmer_idx + K], mphf, states);
+        let mut next_kmer = run.next_kmer();
 
         let mut on_unipath = false;
         let mut unipath_start_kmer = curr_kmer;
@@ -667,7 +664,6 @@ where
                 seq,
                 &unipath_start_kmer,
                 &curr_kmer,
-                mphf,
                 states,
                 seg_writer,
                 seg_buf,
@@ -704,7 +700,6 @@ where
                         seq,
                         &unipath_start_kmer,
                         &curr_kmer,
-                        mphf,
                         states,
                         seg_writer,
                         seg_buf,
@@ -716,7 +711,7 @@ where
                 return kmer_idx + K;
             }
 
-            next_kmer.roll_to_next_kmer(seq[kmer_idx + K], mphf, states);
+            next_kmer = run.next_kmer();
 
             if on_unipath
                 && is_unipath_end(
@@ -730,7 +725,6 @@ where
                     seq,
                     &unipath_start_kmer,
                     &curr_kmer,
-                    mphf,
                     states,
                     seg_writer,
                     seg_buf,
@@ -755,7 +749,6 @@ fn output_gfa_unitig<const K: usize>(
     seq: &[u8],
     start_kmer: &AnnotatedKmer<K>,
     end_kmer: &AnnotatedKmer<K>,
-    mphf: &Mphf<K>,
     states: &AtomicStateVector,
     seg_writer: &Mutex<std::io::BufWriter<std::fs::File>>,
     seg_buf: &mut Vec<u8>,
@@ -765,8 +758,13 @@ fn output_gfa_unitig<const K: usize>(
 ) where
     Kmer<K>: KmerBits,
 {
-    let min_flanking_kmer = std::cmp::min(*start_kmer.canonical(), *end_kmer.canonical());
-    let bucket_id = mphf.bucket_id(&min_flanking_kmer);
+    // The unitig is named by the MPHF index of its smaller flanking k-mer, which
+    // both flanking k-mers already carry.
+    let bucket_id = if start_kmer.canonical() <= end_kmer.canonical() {
+        start_kmer.hash
+    } else {
+        end_kmer.hash
+    };
 
     let unitig_id = bucket_id;
     let unitig_dir = if *start_kmer.kmer() < *end_kmer.rev_compl() {
