@@ -1,3 +1,4 @@
+use crate::batch::{BATCH_BASES, SeqBatch};
 use crate::budget::InFlightBudget;
 use crate::dna::{Base, is_placeholder};
 use crate::minimizer::Partitioning;
@@ -41,7 +42,21 @@ pub fn route_superkmers(
         })
         .collect();
 
+    let route = |seqs: &mut dyn Iterator<Item = &[u8]>| {
+        route_chunk(
+            seqs,
+            m,
+            w,
+            k,
+            num_bins,
+            partitioning,
+            &writers,
+            params.poly_n_stretch,
+        );
+    };
+
     rayon::in_place_scope(|s| {
+        let mut batch = SeqBatch::default();
         for input_file in &params.input_files {
             let mut reader =
                 needletail::parse_fastx_file(input_file).expect("failed to open FASTA file");
@@ -55,26 +70,13 @@ pub fn route_superkmers(
                 }
 
                 if seq_len < CHUNK_BASES {
-                    // Small sequence: copy and spawn async for between-sequence parallelism.
-                    budget.wait_and_acquire(seq_len);
-                    let seq_owned = seq.to_vec();
-                    let partitioning = &partitioning;
-                    let writers = &writers;
-                    let budget = &budget;
-
-                    s.spawn(move |_| {
-                        route_chunk(
-                            &seq_owned,
-                            m,
-                            w,
-                            k,
-                            num_bins,
-                            partitioning,
-                            writers,
-                            params.poly_n_stretch,
-                        );
-                        budget.release(seq_len);
-                    });
+                    // Small sequences are batched for between-sequence parallelism
+                    // (and so that a task's per-bin buffers fill before flushing).
+                    batch.push(&seq);
+                    if batch.bases() >= BATCH_BASES {
+                        std::mem::take(&mut batch)
+                            .spawn(s, budget, |batch| route(&mut batch.iter()));
+                    }
                 } else {
                     // Large sequence: process synchronously with borrowed data (zero copy).
                     // Use fixed-size chunks so simd_minimizers internal allocations stay
@@ -85,27 +87,16 @@ pub fn route_superkmers(
                         while start < seq_len {
                             let end = (start + CHUNK_BASES + overlap).min(seq_len);
                             let chunk = &seq[start..end];
-                            let partitioning = &partitioning;
-                            let writers = &writers;
+                            let route = &route;
 
-                            inner.spawn(move |_| {
-                                route_chunk(
-                                    chunk,
-                                    m,
-                                    w,
-                                    k,
-                                    num_bins,
-                                    partitioning,
-                                    writers,
-                                    params.poly_n_stretch,
-                                );
-                            });
+                            inner.spawn(move |_| route(&mut std::iter::once(chunk)));
                             start += CHUNK_BASES;
                         }
                     });
                 }
             }
         }
+        batch.spawn(s, budget, |batch| route(&mut batch.iter()));
     });
 
     // Finish all writers.
@@ -118,10 +109,10 @@ pub fn route_superkmers(
     Ok(())
 }
 
-/// Route super k-mers from a sequence chunk to bin files.
+/// Route the super k-mers of a run of sequence chunks to bin files.
 #[allow(clippy::too_many_arguments)]
 fn route_chunk(
-    seq: &[u8],
+    seqs: &mut dyn Iterator<Item = &[u8]>,
     m: usize,
     w: usize,
     k: usize,
@@ -177,17 +168,19 @@ fn route_chunk(
             }
         };
 
-    if poly_n {
-        // Split on placeholder (`N`) bases so packed-seq only sees ACGT (it panics
-        // otherwise); a super k-mer never spans a placeholder.
-        crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
-            route_segment(seg, &mut positions, &mut skmer_positions)
-        });
-    } else {
-        // No N handling requested: pass the raw chunk straight through. An input
-        // containing `N` panics here (packed-seq), as before — see the rationale in
-        // `minimizer::count_minimizers_chunk`.
-        route_segment(seq, &mut positions, &mut skmer_positions);
+    for seq in seqs {
+        if poly_n {
+            // Split on placeholder (`N`) bases so packed-seq only sees ACGT (it
+            // panics otherwise); a super k-mer never spans a placeholder.
+            crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
+                route_segment(seg, &mut positions, &mut skmer_positions)
+            });
+        } else {
+            // No N handling requested: pass the raw chunk straight through. An
+            // input containing `N` panics here (packed-seq), as before — see the
+            // rationale in `minimizer::count_minimizers_chunk`.
+            route_segment(seq, &mut positions, &mut skmer_positions);
+        }
     }
 
     flush_all_buffers(&mut buffers, writers);

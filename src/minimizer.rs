@@ -1,3 +1,4 @@
+use crate::batch::{BATCH_BASES, SeqBatch};
 use crate::budget::InFlightBudget;
 use crate::params::Params;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,7 +42,22 @@ pub fn count_minimizer_histogram(
         .map(|_| AtomicU64::new(0))
         .collect();
 
+    // Each task counts into its own histogram and merges it once, so workers
+    // never contend on the shared counters per minimizer.
+    let count_into_shared = |seqs: &mut dyn Iterator<Item = &[u8]>| {
+        let mut local = vec![0u32; NUM_HISTOGRAM_BUCKETS];
+        for seq in seqs {
+            count_minimizers_chunk(seq, m, w, &mut local, params.poly_n_stretch);
+        }
+        for (shared, &count) in histogram.iter().zip(&local) {
+            if count > 0 {
+                shared.fetch_add(count as u64, Ordering::Relaxed);
+            }
+        }
+    };
+
     rayon::in_place_scope(|s| {
+        let mut batch = SeqBatch::default();
         for input_file in &params.input_files {
             let mut reader =
                 needletail::parse_fastx_file(input_file).expect("failed to open FASTA file");
@@ -55,16 +71,12 @@ pub fn count_minimizer_histogram(
                 }
 
                 if seq_len < CHUNK_BASES {
-                    // Small sequence: copy and spawn async for between-sequence parallelism.
-                    budget.wait_and_acquire(seq_len);
-                    let seq_owned = seq.to_vec();
-                    let histogram = &histogram;
-                    let budget = &budget;
-
-                    s.spawn(move |_| {
-                        count_minimizers_chunk(&seq_owned, m, w, histogram, params.poly_n_stretch);
-                        budget.release(seq_len);
-                    });
+                    // Small sequences are batched for between-sequence parallelism.
+                    batch.push(&seq);
+                    if batch.bases() >= BATCH_BASES {
+                        std::mem::take(&mut batch)
+                            .spawn(s, budget, |batch| count_into_shared(&mut batch.iter()));
+                    }
                 } else {
                     // Large sequence: process synchronously with borrowed data (zero copy).
                     // Use fixed-size chunks so simd_minimizers internal allocations stay
@@ -74,16 +86,10 @@ pub fn count_minimizer_histogram(
                         while start < seq_len {
                             let end = (start + CHUNK_BASES).min(seq_len);
                             let chunk = &seq[start..end];
-                            let histogram = &histogram;
+                            let count_into_shared = &count_into_shared;
 
                             inner.spawn(move |_| {
-                                count_minimizers_chunk(
-                                    chunk,
-                                    m,
-                                    w,
-                                    histogram,
-                                    params.poly_n_stretch,
-                                );
+                                count_into_shared(&mut std::iter::once(chunk));
                             });
                             start += CHUNK_BASES;
                         }
@@ -91,6 +97,7 @@ pub fn count_minimizer_histogram(
                 }
             }
         }
+        batch.spawn(s, budget, |batch| count_into_shared(&mut batch.iter()));
     });
 
     let counts: Vec<u64> = histogram
@@ -106,7 +113,7 @@ pub fn count_minimizer_histogram(
     Ok(counts)
 }
 
-/// Count minimizers in a sequence chunk into the shared histogram.
+/// Count minimizers in a sequence chunk into `histogram`.
 ///
 /// When `poly_n` is set, splits on placeholder (`N`) bases so
 /// `simd_minimizers`/packed-seq only ever sees ACGT (it panics on other bytes)
@@ -115,15 +122,14 @@ pub fn count_minimizer_histogram(
 /// before N handling was added. This keeps `poly_n_stretch` the single switch for
 /// N support: without it the output phase would silently drop the poly-N gaps and
 /// emit a tiling with wrong reference positions, so we fail loudly instead.
-fn count_minimizers_chunk(seq: &[u8], m: usize, w: usize, histogram: &[AtomicU64], poly_n: bool) {
+fn count_minimizers_chunk(seq: &[u8], m: usize, w: usize, histogram: &mut [u32], poly_n: bool) {
     let mut positions: Vec<u32> = Vec::new();
     let mut count = |seg: &[u8]| {
         positions.clear();
         let ascii_seq = simd_minimizers::packed_seq::AsciiSeq(seg);
         let output = simd_minimizers::canonical_minimizers(m, w).run(ascii_seq, &mut positions);
         for (_pos, val) in output.pos_and_values_u64() {
-            let bucket = bucket_hash(val);
-            histogram[bucket].fetch_add(1, Ordering::Relaxed);
+            histogram[bucket_hash(val)] += 1;
         }
     };
     if poly_n {
