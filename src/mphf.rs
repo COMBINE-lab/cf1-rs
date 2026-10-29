@@ -1,11 +1,13 @@
+use crate::dna::Base;
 use crate::kmer::{Kmer, KmerBits};
 use crate::minimizer::Partitioning;
-use crate::superkmer::{BinReader, bin_file_path};
+use crate::superkmer::{bin_file_path, packed_superkmers};
 use ph::fmph::keyset::CachedKeySet;
 use rayon::prelude::*;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
 
 /// PHast+ (8-bit seeds, wrapped shifts): the in-memory MPHF.
@@ -59,10 +61,12 @@ where
     /// Build a global MPHF by reading canonical k-mers from all bin temp files.
     ///
     /// Phase 3a: Each bin is deduplicated independently in parallel (canonical minimizers
-    /// guarantee no cross-bin duplicates). Deduplicated k-mers are written back to binary files.
+    /// guarantee no cross-bin duplicates). In the in-memory regime the deduplicated
+    /// k-mers stay in memory; otherwise they are written back to binary files.
     ///
-    /// Phase 3b: The MPHF is built by streaming k-mers from the binary files using
-    /// `CachedKeySet`, avoiding holding the entire keyset in memory.
+    /// Phase 3b (streaming regime only): The MPHF is built by streaming k-mers from
+    /// the binary files using `CachedKeySet`, avoiding holding the entire keyset in
+    /// memory.
     pub fn build(
         partitioning: &Partitioning,
         work_dir: &Path,
@@ -115,20 +119,31 @@ where
         let num_bins = partitioning.num_bins();
         info!("Reading canonical k-mers from {} bins", num_bins);
 
-        // Phase 3a: Dedup each bin's k-mers and write to binary files.
+        // Phase 3a: Dedup each bin's k-mers. While the running total of distinct
+        // k-mers stays within `clone_threshold` (the in-memory regime), a bin's
+        // k-mers are kept in memory; beyond it they are written to a binary file
+        // for streaming. Totals only grow, so if the final total is within the
+        // threshold every bin was kept, and the keys never touch the disk.
         info!(
             "P3a: RSS before dedup: current={} MB, peak={} MB",
             crate::pipeline::current_rss_mb(),
             crate::pipeline::peak_rss_mb()
         );
-        let per_bin_counts: Vec<usize> = (0..num_bins)
+        let running_total = AtomicUsize::new(0);
+        let bins: Vec<DedupedBin<K>> = (0..num_bins)
             .into_par_iter()
             .map(|bin| {
-                let src = bin_file_path(work_dir, bin);
-                let dst = dedup_file_path(work_dir, bin);
-                dedup_bin::<K>(&src, &dst)
+                let kmers = dedup_bin_kmers::<K>(&bin_file_path(work_dir, bin));
+                let count = kmers.len();
+                if running_total.fetch_add(count, Ordering::Relaxed) + count <= clone_threshold {
+                    DedupedBin::InMemory(kmers)
+                } else {
+                    write_kmers::<K>(&dedup_file_path(work_dir, bin), &kmers);
+                    DedupedBin::OnDisk(count)
+                }
             })
             .collect();
+        let per_bin_counts: Vec<usize> = bins.iter().map(DedupedBin::len).collect();
 
         let total: usize = per_bin_counts.iter().sum();
         let max_bin = per_bin_counts.iter().max().unwrap_or(&0);
@@ -146,6 +161,39 @@ where
             crate::pipeline::current_rss_mb(),
             crate::pipeline::peak_rss_mb()
         );
+
+        if total <= clone_threshold {
+            // Small input: gather the keys in memory and build PHast+, whose
+            // evaluation is what phases 4 and 5 are bound by (see `MphfImpl`).
+            info!(
+                "Building global MPHF for {} distinct canonical k-mers (in-memory, threads={})",
+                total,
+                rayon::current_num_threads()
+            );
+            let mut keys = Vec::with_capacity(total);
+            for bin in bins {
+                match bin {
+                    DedupedBin::InMemory(kmers) => {
+                        keys.extend(kmers.into_iter().map(|bits| KmerKey(Kmer { bits })));
+                    }
+                    DedupedBin::OnDisk(_) => unreachable!("bin spilled within the threshold"),
+                }
+            }
+            let mphf = build_phast(keys);
+            info!("MPHF construction complete");
+            return Ok(Mphf {
+                mphf,
+                total_kmers: total as u64,
+                _phantom: std::marker::PhantomData,
+            });
+        }
+
+        // Large input: spill the bins still in memory, so every bin has a file.
+        bins.into_par_iter().enumerate().for_each(|(bin, deduped)| {
+            if let DedupedBin::InMemory(kmers) = deduped {
+                write_kmers::<K>(&dedup_file_path(work_dir, bin), &kmers);
+            }
+        });
 
         // Phase 3b: Consolidate per-bin dedup files into a single file for parallel streaming.
         let consolidated_path = work_dir.join("cf1_dedup_all.bin");
@@ -168,47 +216,33 @@ where
             crate::pipeline::peak_rss_mb()
         );
 
-        let kmer_size = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>();
-        let storage_size = kmer_size;
+        let storage_size = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>();
         let mt = rayon::current_num_threads() > 1;
 
-        let mphf = if total <= clone_threshold {
-            // Small input: load all keys into memory and build PHast+, whose
-            // evaluation is what phases 4 and 5 are bound by (see `MphfImpl`).
-            info!(
-                "Building global MPHF for {} distinct canonical k-mers (in-memory, threads={})",
-                total,
-                rayon::current_num_threads()
-            );
-            build_phast(read_all_kmers::<K>(&consolidated_path, storage_size))
-        } else {
-            // Large input: stream k-mers from disk via SPMC parallel iterator.
-            // CachedKeySet caches surviving keys once count drops below threshold.
-            info!(
-                "Building global MPHF for {} distinct canonical k-mers (streaming, clone_threshold={}, threads={})",
-                total,
-                clone_threshold,
-                rayon::current_num_threads()
-            );
-            let conf = ph::fmph::BuildConf {
-                relative_level_size: 200,
-                use_multiple_threads: mt,
-                ..Default::default()
-            };
-            let consolidated = Arc::new(consolidated_path.clone());
-            let consolidated2 = Arc::clone(&consolidated);
-            let keys = CachedKeySet::dynamic_with_len(
-                (
-                    move || KmerFileIterator::<K>::new(Arc::clone(&consolidated), storage_size),
-                    move || {
-                        KmerSpmcParIter::<K>::new(Arc::clone(&consolidated2), total, storage_size)
-                    },
-                ),
-                total,
-                clone_threshold,
-            );
-            MphfImpl::Fmph(ph::fmph::Function::with_conf(keys, conf))
+        // Stream k-mers from disk via SPMC parallel iterator.
+        // CachedKeySet caches surviving keys once count drops below threshold.
+        info!(
+            "Building global MPHF for {} distinct canonical k-mers (streaming, clone_threshold={}, threads={})",
+            total,
+            clone_threshold,
+            rayon::current_num_threads()
+        );
+        let conf = ph::fmph::BuildConf {
+            relative_level_size: 200,
+            use_multiple_threads: mt,
+            ..Default::default()
         };
+        let consolidated = Arc::new(consolidated_path.clone());
+        let consolidated2 = Arc::clone(&consolidated);
+        let keys = CachedKeySet::dynamic_with_len(
+            (
+                move || KmerFileIterator::<K>::new(Arc::clone(&consolidated), storage_size),
+                move || KmerSpmcParIter::<K>::new(Arc::clone(&consolidated2), total, storage_size),
+            ),
+            total,
+            clone_threshold,
+        );
+        let mphf = MphfImpl::Fmph(ph::fmph::Function::with_conf(keys, conf));
 
         info!("MPHF construction complete");
 
@@ -278,7 +312,9 @@ where
     }
 
     /// Look up the global hash index for a canonical k-mer.
-    #[inline]
+    // Always inlined: it sits in the per-k-mer loops of phases 4 and 5, and the
+    // dispatch on the MPHF kind would otherwise make it too big to inline there.
+    #[inline(always)]
     pub fn hash(&self, canonical_kmer: &Kmer<K>) -> u64 {
         match &self.mphf {
             MphfImpl::Fmph(f) => f.get(&KmerKey(*canonical_kmer)).unwrap_or(0),
@@ -342,41 +378,88 @@ where
     Kmer<K>: KmerBits,
     <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
 {
-    let storage_size = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>();
+    let kmers = dedup_bin_kmers::<K>(src);
+    write_kmers::<K>(dst, &kmers);
+    kmers.len()
+}
 
-    // Collect all canonical k-mer storage values.
-    let mut kmer_vals: Vec<<Kmer<K> as KmerBits>::Storage> = Vec::new();
+/// A bin's distinct canonical k-mers, kept in memory or already written to the
+/// bin's dedup file.
+enum DedupedBin<const K: usize>
+where
+    Kmer<K>: KmerBits,
+{
+    InMemory(Vec<<Kmer<K> as KmerBits>::Storage>),
+    OnDisk(usize),
+}
 
-    if let Ok(mut reader) = BinReader::new(src) {
-        while let Ok(Some((base_count, packed))) = reader.read_packed_superkmer() {
-            if base_count >= K {
-                let num_kmers = base_count - K + 1;
-                for i in 0..num_kmers {
-                    let kmer = Kmer::<K>::from_packed_2bit(packed, i);
-                    let canonical = kmer.canonical();
-                    kmer_vals.push(canonical.bits);
-                }
+impl<const K: usize> DedupedBin<K>
+where
+    Kmer<K>: KmerBits,
+{
+    fn len(&self) -> usize {
+        match self {
+            DedupedBin::InMemory(kmers) => kmers.len(),
+            DedupedBin::OnDisk(count) => *count,
+        }
+    }
+}
+
+/// Read a bin's packed super k-mers and return its distinct canonical k-mers,
+/// sorted.
+fn dedup_bin_kmers<const K: usize>(src: &Path) -> Vec<<Kmer<K> as KmerBits>::Storage>
+where
+    Kmer<K>: KmerBits,
+    <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
+{
+    // A missing bin file is an empty bin.
+    let data = std::fs::read(src).unwrap_or_default();
+
+    // Collect all canonical k-mer storage values, sized up front so the
+    // (occurrence-sized) buffer is never regrown.
+    let num_kmers: usize = packed_superkmers(&data)
+        .map(|(base_count, _)| (base_count + 1).saturating_sub(K))
+        .sum();
+    let mut kmer_vals: Vec<<Kmer<K> as KmerBits>::Storage> = Vec::with_capacity(num_kmers);
+    for (base_count, packed) in packed_superkmers(&data) {
+        if base_count >= K {
+            // Roll through the super k-mer rather than decoding (and reverse-
+            // complementing) every k-mer from scratch.
+            let mut kmer = Kmer::<K>::from_packed_2bit(packed, 0);
+            let mut rc = kmer.reverse_complement();
+            kmer_vals.push(kmer.canonical_with_rc(&rc).bits);
+            for j in K..base_count {
+                let code = (packed[j / 4] >> (6 - 2 * (j % 4))) & 0b11;
+                kmer.roll_to_next_kmer(Base::from_2bit(code), &mut rc);
+                kmer_vals.push(kmer.canonical_with_rc(&rc).bits);
             }
         }
     }
+    drop(data);
 
-    // Radix sort and deduplicate.
+    // Radix sort and deduplicate. Distinct k-mers are typically a small
+    // fraction of the occurrences, and the result may be held until every bin
+    // is done, so give the excess capacity back.
     RadixSortDedup::radix_sort_dedup(&mut kmer_vals);
+    kmer_vals.shrink_to_fit();
+    kmer_vals
+}
 
-    let count = kmer_vals.len();
-
-    // Write deduplicated canonical k-mers as raw binary (native endian Storage bytes).
+/// Write k-mers to `dst` as raw binary (native endian Storage bytes).
+fn write_kmers<const K: usize>(dst: &Path, kmers: &[<Kmer<K> as KmerBits>::Storage])
+where
+    Kmer<K>: KmerBits,
+{
+    let storage_size = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>();
     let file = std::fs::File::create(dst).expect("Failed to create dedup file");
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
-    for val in &kmer_vals {
+    for val in kmers {
         let bytes = <Kmer<K> as KmerBits>::as_bytes(val);
         writer
             .write_all(&bytes[..storage_size])
             .expect("Failed to write k-mer");
     }
     writer.flush().expect("Failed to flush dedup file");
-
-    count
 }
 
 /// Iterator that reads KmerKey<K> values from the consolidated binary file via BufReader.

@@ -297,6 +297,20 @@ impl BinWriter {
     }
 }
 
+/// Iterate the packed super k-mers of a bin file's contents, as
+/// `(base_count, packed_bytes)` (the format [`BinReader`] reads). A truncated
+/// trailing record ends the iteration.
+pub fn packed_superkmers(data: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        let (len, tail) = rest.split_first_chunk::<2>()?;
+        let base_count = u16::from_le_bytes(*len) as usize;
+        let packed = tail.get(..base_count.div_ceil(4))?;
+        rest = &tail[packed.len()..];
+        Some((base_count, packed))
+    })
+}
+
 /// Reader for a single bin's packed super k-mers.
 pub struct BinReader {
     reader: BufReader<std::fs::File>,
