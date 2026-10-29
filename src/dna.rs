@@ -113,7 +113,7 @@ const MAPPED_BASE: [u8; 256] = {
 
 const COMPLEMENTED_BASE: [Base; 4] = [Base::T, Base::G, Base::C, Base::A];
 
-const MAPPED_CHAR: [u8; 4] = [b'A', b'C', b'G', b'T'];
+const MAPPED_CHAR: [u8; 4] = *b"ACGT";
 
 const IS_PLACEHOLDER: [bool; 256] = {
     let mut table = [true; 256];

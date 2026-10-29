@@ -412,11 +412,10 @@ where
         "Extracted {} unitigs, {} vertices, avg length {}",
         result.unipath_count,
         result.kmer_count,
-        if result.unipath_count > 0 {
-            result.sum_len / result.unipath_count
-        } else {
-            0
-        }
+        result
+            .sum_len
+            .checked_div(result.unipath_count)
+            .unwrap_or(0)
     );
 
     Ok((result, untiled_seqs))
@@ -852,7 +851,7 @@ pub fn write_json(
             "shortest maximal unitig length": if meta.min_len == usize::MAX { 0 } else { meta.min_len },
             "longest maximal unitig length": meta.max_len,
             "sum maximal unitig length": meta.sum_len,
-            "avg. maximal unitig length": if meta.unipath_count > 0 { meta.sum_len / meta.unipath_count } else { 0 },
+            "avg. maximal unitig length": meta.sum_len.checked_div(meta.unipath_count).unwrap_or(0),
             "_comment": "lengths are in bases",
         },
     });
