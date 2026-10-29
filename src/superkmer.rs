@@ -3,6 +3,9 @@ use crate::budget::InFlightBudget;
 use crate::dna::{Base, is_placeholder};
 use crate::minimizer::Partitioning;
 use crate::params::Params;
+use nohash_hasher::BuildNoHashHasher;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -125,6 +128,7 @@ fn route_chunk(
     let mut skmer_positions: Vec<u32> = Vec::new();
     let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); num_bins];
     let mut pack_buf: Vec<u8> = Vec::new();
+    let mut routed = RoutedSuperkmers::default();
 
     // Route the super k-mers of one ACGT-only (sub)sequence. Only k-mer *content*
     // is packed (positions are not stored), so each segment is processed
@@ -164,7 +168,15 @@ fn route_chunk(
                 let hash = pos_vals[sk_idx].1;
                 let bin = partitioning.bin_for_minimizer(hash);
 
-                write_packed_segments(subseq, k, bin, &mut buffers, writers, &mut pack_buf);
+                write_packed_segments(
+                    subseq,
+                    k,
+                    bin,
+                    &mut buffers,
+                    writers,
+                    &mut pack_buf,
+                    &mut routed,
+                );
             }
         };
 
@@ -194,45 +206,99 @@ fn write_packed_segments(
     buffers: &mut [Vec<u8>],
     writers: &[Mutex<BinWriter>],
     pack_buf: &mut Vec<u8>,
+    routed: &mut RoutedSuperkmers,
 ) {
     // Find N-free segments.
     let mut seg_start = 0;
     for i in 0..subseq.len() {
         if is_placeholder(subseq[i]) {
             if i - seg_start >= k {
-                pack_and_buffer(&subseq[seg_start..i], bin, buffers, writers, pack_buf);
+                pack_and_buffer(
+                    &subseq[seg_start..i],
+                    bin,
+                    buffers,
+                    writers,
+                    pack_buf,
+                    routed,
+                );
             }
             seg_start = i + 1;
         }
     }
     // Final segment.
     if subseq.len() - seg_start >= k {
-        pack_and_buffer(&subseq[seg_start..], bin, buffers, writers, pack_buf);
+        pack_and_buffer(
+            &subseq[seg_start..],
+            bin,
+            buffers,
+            writers,
+            pack_buf,
+            routed,
+        );
     }
 }
 
-/// Pack an N-free ASCII segment to 2-bit and append to the bin buffer.
+/// The super k-mers a task has already routed, so exact repeats can be dropped.
+///
+/// Isoforms of a gene are usually adjacent in a transcriptome and share most
+/// of their sequence, so a batch repeats many super k-mers verbatim. A repeat
+/// adds nothing to the distinct k-mers its bin yields, only bytes to write and
+/// k-mers to sort and deduplicate in phase 3.
+#[derive(Default)]
+struct RoutedSuperkmers {
+    /// Distinct packed records (length prefix + packed bases), back to back.
+    records: Vec<u8>,
+    /// XXH3 digest of a record -> its offset in `records`.
+    index: HashMap<u64, usize, BuildNoHashHasher<u64>>,
+}
+
+impl RoutedSuperkmers {
+    /// Record `record` and report whether it is new. Repeats are recognized
+    /// by content, never by digest alone: on a digest collision between
+    /// different records the second is simply reported as new.
+    fn insert(&mut self, record: &[u8]) -> bool {
+        match self.index.entry(xxhash_rust::xxh3::xxh3_64(record)) {
+            Entry::Occupied(seen) => {
+                let start = *seen.get();
+                self.records.get(start..start + record.len()) != Some(record)
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(self.records.len());
+                self.records.extend_from_slice(record);
+                true
+            }
+        }
+    }
+}
+
+/// Pack an N-free ASCII segment to 2-bit and append to the bin buffer, unless
+/// this task has already routed the identical super k-mer.
 fn pack_and_buffer(
     ascii: &[u8],
     bin: usize,
     buffers: &mut [Vec<u8>],
     writers: &[Mutex<BinWriter>],
     pack_buf: &mut Vec<u8>,
+    routed: &mut RoutedSuperkmers,
 ) {
     let base_len = ascii.len() as u16;
     let packed_bytes = ascii.len().div_ceil(4);
 
-    // Pack into reusable buffer.
+    // Pack the record (length + packed data) into the reusable buffer.
     pack_buf.clear();
-    pack_buf.resize(packed_bytes, 0);
+    pack_buf.extend_from_slice(&base_len.to_le_bytes());
+    pack_buf.resize(2 + packed_bytes, 0);
+    let packed = &mut pack_buf[2..];
     for (i, &ch) in ascii.iter().enumerate() {
         let base = Base::map_base(ch) as u8;
-        pack_buf[i / 4] |= base << (6 - 2 * (i % 4));
+        packed[i / 4] |= base << (6 - 2 * (i % 4));
+    }
+    if !routed.insert(pack_buf) {
+        return;
     }
 
-    // Append length + packed data to bin buffer.
+    // Append the record to the bin buffer.
     let buf = &mut buffers[bin];
-    buf.extend_from_slice(&base_len.to_le_bytes());
     buf.extend_from_slice(pack_buf);
 
     // Flush if buffer exceeds threshold.
