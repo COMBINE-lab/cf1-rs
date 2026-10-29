@@ -8,12 +8,46 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
+/// PHast+ (8-bit seeds, wrapped shifts): the in-memory MPHF.
+type PhastFunction = ph::phast::Function2<ph::seeds::Bits8, ph::phast::ShiftOnlyWrapped>;
+
+/// The MPHF backing [`Mphf`], chosen by construction regime.
+///
+/// Phases 4 and 5 evaluate the MPHF once per k-mer *occurrence* in the input
+/// (on a transcriptome, several times the number of distinct k-mers), so
+/// evaluation speed dominates their running time. PHast+ answers almost every
+/// query with one seed read, where FMPH probes a bit array per level and then a
+/// rank structure — about twice the cache misses. Its construction needs every
+/// key in memory, though, so inputs too large for the in-memory regime keep
+/// FMPH, which can be built by streaming the keys from disk.
+enum MphfImpl {
+    Fmph(ph::fmph::Function),
+    Phast(PhastFunction),
+}
+
+/// Build the in-memory-regime MPHF over `keys`.
+fn build_phast<const K: usize>(keys: Vec<KmerKey<K>>) -> MphfImpl
+where
+    Kmer<K>: KmerBits,
+{
+    MphfImpl::Phast(PhastFunction::with_vec_p_threads_hash_sc(
+        keys,
+        &ph::phast::Params::new(
+            ph::seeds::Bits8,
+            ph::phast::bits_per_seed_to_100_bucket_size(8),
+        ),
+        rayon::current_num_threads(),
+        ph::BuildDefaultSeededHasher::default(),
+        ph::phast::ShiftOnlyWrapped,
+    ))
+}
+
 /// Global minimal perfect hash function over all canonical k-mers.
 pub struct Mphf<const K: usize>
 where
     Kmer<K>: KmerBits,
 {
-    mphf: ph::fmph::Function,
+    mphf: MphfImpl,
     total_kmers: u64,
     _phantom: std::marker::PhantomData<Kmer<K>>,
 }
@@ -49,12 +83,9 @@ where
     /// Two regimes, chosen automatically based on `total` vs `clone_threshold`:
     ///
     /// **In-memory** (`total <= clone_threshold`): All k-mers are read into a `Vec`
-    /// before MPHF construction. `ph::fmph`'s `BuildConf::cache_threshold` is set to
-    /// `0` so that `ph` does **not** allocate a parallel `Vec<usize>` of hashed
-    /// indices each level (which would cost `total × 8` bytes per level for wyhash
-    /// keys that rehash in nanoseconds). The resulting peak RSS is dominated by the
-    /// key Vec itself (`total × 8` bytes) plus the per-level bit-arrays (~`2 × total`
-    /// bits each). Suitable when `total` fits comfortably in RAM.
+    /// and a PHast+ function is built over them (see [`MphfImpl`] for why). Peak
+    /// RSS is dominated by the key Vec plus PHast's sorted level-0 hashes
+    /// (`total × 8` bytes each). Suitable when `total` fits comfortably in RAM.
     ///
     /// **Streaming** (`total > clone_threshold`): Keys are read from the consolidated
     /// dedup file on every MPHF pass using a **SPMC iterator** (one dedicated I/O
@@ -142,24 +173,14 @@ where
         let mt = rayon::current_num_threads() > 1;
 
         let mphf = if total <= clone_threshold {
-            // Small input: load all keys into memory. Avoids CachedKeySet's
-            // streaming overhead and duplicate allocations during construction.
-            // cache_threshold=0 disables the bit_indices Vec<usize> allocation
-            // (768 MB for 96M keys) — wyhash over 8 bytes is fast enough that
-            // recomputing per-level costs nothing.
+            // Small input: load all keys into memory and build PHast+, whose
+            // evaluation is what phases 4 and 5 are bound by (see `MphfImpl`).
             info!(
                 "Building global MPHF for {} distinct canonical k-mers (in-memory, threads={})",
                 total,
                 rayon::current_num_threads()
             );
-            let conf = ph::fmph::BuildConf {
-                relative_level_size: 200,
-                use_multiple_threads: mt,
-                cache_threshold: 0,
-                ..Default::default()
-            };
-            let keys = read_all_kmers::<K>(&consolidated_path, storage_size);
-            ph::fmph::Function::with_conf(keys, conf)
+            build_phast(read_all_kmers::<K>(&consolidated_path, storage_size))
         } else {
             // Large input: stream k-mers from disk via SPMC parallel iterator.
             // CachedKeySet caches surviving keys once count drops below threshold.
@@ -186,7 +207,7 @@ where
                 total,
                 clone_threshold,
             );
-            ph::fmph::Function::with_conf(keys, conf)
+            MphfImpl::Fmph(ph::fmph::Function::with_conf(keys, conf))
         };
 
         info!("MPHF construction complete");
@@ -219,14 +240,7 @@ where
                 total,
                 rayon::current_num_threads()
             );
-            let conf = ph::fmph::BuildConf {
-                relative_level_size: 200,
-                use_multiple_threads: mt,
-                cache_threshold: 0,
-                ..Default::default()
-            };
-            let keys = read_all_kmers::<K>(consolidated_path, storage_size);
-            ph::fmph::Function::with_conf(keys, conf)
+            build_phast(read_all_kmers::<K>(consolidated_path, storage_size))
         } else {
             info!(
                 "Building global MPHF for {} distinct canonical k-mers (streaming, clone_threshold={}, threads={})",
@@ -251,7 +265,7 @@ where
                 total,
                 clone_threshold,
             );
-            ph::fmph::Function::with_conf(keys, conf)
+            MphfImpl::Fmph(ph::fmph::Function::with_conf(keys, conf))
         };
 
         info!("MPHF construction complete");
@@ -266,7 +280,10 @@ where
     /// Look up the global hash index for a canonical k-mer.
     #[inline]
     pub fn hash(&self, canonical_kmer: &Kmer<K>) -> u64 {
-        self.mphf.get(&KmerKey(*canonical_kmer)).unwrap_or(0)
+        match &self.mphf {
+            MphfImpl::Fmph(f) => f.get(&KmerKey(*canonical_kmer)).unwrap_or(0),
+            MphfImpl::Phast(f) => f.get(&KmerKey(*canonical_kmer)) as u64,
+        }
     }
 
     /// Get the bucket_id for a canonical k-mer (used for unitig IDs).
