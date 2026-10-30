@@ -1,6 +1,6 @@
 [package]
 name = "cf1-rs"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Rob Patro <rob@cs.umd.edu>"]
@@ -16,7 +16,10 @@ readme = "README.md"
 clap = { version = "4.6.4", features = ["derive"] }
 rayon = "1.12"
 needletail = "0.7"
-ph = { version = "0.11", default-features = false, features = ["wyhash"] }
+sux = { version = "0.15.3", default-features = false, features = ["rayon"] }
+lender = "0.8"
+dsi-progress-logger = "0.8.10"
+rapidhash = "4.5.1"
 simd-minimizers = "3.0"
 voracious_radix_sort = "1"
 tracing = "0.1.44"

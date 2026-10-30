@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod budget;
 pub mod classify;
 pub mod directed_kmer;

@@ -1,7 +1,11 @@
+use crate::batch::{BATCH_BASES, SeqBatch};
 use crate::budget::InFlightBudget;
 use crate::dna::{Base, is_placeholder};
 use crate::minimizer::Partitioning;
 use crate::params::Params;
+use nohash_hasher::BuildNoHashHasher;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -41,7 +45,21 @@ pub fn route_superkmers(
         })
         .collect();
 
+    let route = |seqs: &mut dyn Iterator<Item = &[u8]>| {
+        route_chunk(
+            seqs,
+            m,
+            w,
+            k,
+            num_bins,
+            partitioning,
+            &writers,
+            params.poly_n_stretch,
+        );
+    };
+
     rayon::in_place_scope(|s| {
+        let mut batch = SeqBatch::default();
         for input_file in &params.input_files {
             let mut reader =
                 needletail::parse_fastx_file(input_file).expect("failed to open FASTA file");
@@ -55,26 +73,13 @@ pub fn route_superkmers(
                 }
 
                 if seq_len < CHUNK_BASES {
-                    // Small sequence: copy and spawn async for between-sequence parallelism.
-                    budget.wait_and_acquire(seq_len);
-                    let seq_owned = seq.to_vec();
-                    let partitioning = &partitioning;
-                    let writers = &writers;
-                    let budget = &budget;
-
-                    s.spawn(move |_| {
-                        route_chunk(
-                            &seq_owned,
-                            m,
-                            w,
-                            k,
-                            num_bins,
-                            partitioning,
-                            writers,
-                            params.poly_n_stretch,
-                        );
-                        budget.release(seq_len);
-                    });
+                    // Small sequences are batched for between-sequence parallelism
+                    // (and so that a task's per-bin buffers fill before flushing).
+                    batch.push(&seq);
+                    if batch.bases() >= BATCH_BASES {
+                        std::mem::take(&mut batch)
+                            .spawn(s, budget, |batch| route(&mut batch.iter()));
+                    }
                 } else {
                     // Large sequence: process synchronously with borrowed data (zero copy).
                     // Use fixed-size chunks so simd_minimizers internal allocations stay
@@ -85,27 +90,16 @@ pub fn route_superkmers(
                         while start < seq_len {
                             let end = (start + CHUNK_BASES + overlap).min(seq_len);
                             let chunk = &seq[start..end];
-                            let partitioning = &partitioning;
-                            let writers = &writers;
+                            let route = &route;
 
-                            inner.spawn(move |_| {
-                                route_chunk(
-                                    chunk,
-                                    m,
-                                    w,
-                                    k,
-                                    num_bins,
-                                    partitioning,
-                                    writers,
-                                    params.poly_n_stretch,
-                                );
-                            });
+                            inner.spawn(move |_| route(&mut std::iter::once(chunk)));
                             start += CHUNK_BASES;
                         }
                     });
                 }
             }
         }
+        batch.spawn(s, budget, |batch| route(&mut batch.iter()));
     });
 
     // Finish all writers.
@@ -118,10 +112,10 @@ pub fn route_superkmers(
     Ok(())
 }
 
-/// Route super k-mers from a sequence chunk to bin files.
+/// Route the super k-mers of a run of sequence chunks to bin files.
 #[allow(clippy::too_many_arguments)]
 fn route_chunk(
-    seq: &[u8],
+    seqs: &mut dyn Iterator<Item = &[u8]>,
     m: usize,
     w: usize,
     k: usize,
@@ -134,6 +128,7 @@ fn route_chunk(
     let mut skmer_positions: Vec<u32> = Vec::new();
     let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); num_bins];
     let mut pack_buf: Vec<u8> = Vec::new();
+    let mut routed = RoutedSuperkmers::default();
 
     // Route the super k-mers of one ACGT-only (sub)sequence. Only k-mer *content*
     // is packed (positions are not stored), so each segment is processed
@@ -173,21 +168,31 @@ fn route_chunk(
                 let hash = pos_vals[sk_idx].1;
                 let bin = partitioning.bin_for_minimizer(hash);
 
-                write_packed_segments(subseq, k, bin, &mut buffers, writers, &mut pack_buf);
+                write_packed_segments(
+                    subseq,
+                    k,
+                    bin,
+                    &mut buffers,
+                    writers,
+                    &mut pack_buf,
+                    &mut routed,
+                );
             }
         };
 
-    if poly_n {
-        // Split on placeholder (`N`) bases so packed-seq only sees ACGT (it panics
-        // otherwise); a super k-mer never spans a placeholder.
-        crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
-            route_segment(seg, &mut positions, &mut skmer_positions)
-        });
-    } else {
-        // No N handling requested: pass the raw chunk straight through. An input
-        // containing `N` panics here (packed-seq), as before — see the rationale in
-        // `minimizer::count_minimizers_chunk`.
-        route_segment(seq, &mut positions, &mut skmer_positions);
+    for seq in seqs {
+        if poly_n {
+            // Split on placeholder (`N`) bases so packed-seq only sees ACGT (it
+            // panics otherwise); a super k-mer never spans a placeholder.
+            crate::dna::for_each_acgt_segment(seq, k, |_seg_start, seg| {
+                route_segment(seg, &mut positions, &mut skmer_positions)
+            });
+        } else {
+            // No N handling requested: pass the raw chunk straight through. An
+            // input containing `N` panics here (packed-seq), as before — see the
+            // rationale in `minimizer::count_minimizers_chunk`.
+            route_segment(seq, &mut positions, &mut skmer_positions);
+        }
     }
 
     flush_all_buffers(&mut buffers, writers);
@@ -201,45 +206,99 @@ fn write_packed_segments(
     buffers: &mut [Vec<u8>],
     writers: &[Mutex<BinWriter>],
     pack_buf: &mut Vec<u8>,
+    routed: &mut RoutedSuperkmers,
 ) {
     // Find N-free segments.
     let mut seg_start = 0;
     for i in 0..subseq.len() {
         if is_placeholder(subseq[i]) {
             if i - seg_start >= k {
-                pack_and_buffer(&subseq[seg_start..i], bin, buffers, writers, pack_buf);
+                pack_and_buffer(
+                    &subseq[seg_start..i],
+                    bin,
+                    buffers,
+                    writers,
+                    pack_buf,
+                    routed,
+                );
             }
             seg_start = i + 1;
         }
     }
     // Final segment.
     if subseq.len() - seg_start >= k {
-        pack_and_buffer(&subseq[seg_start..], bin, buffers, writers, pack_buf);
+        pack_and_buffer(
+            &subseq[seg_start..],
+            bin,
+            buffers,
+            writers,
+            pack_buf,
+            routed,
+        );
     }
 }
 
-/// Pack an N-free ASCII segment to 2-bit and append to the bin buffer.
+/// The super k-mers a task has already routed, so exact repeats can be dropped.
+///
+/// Isoforms of a gene are usually adjacent in a transcriptome and share most
+/// of their sequence, so a batch repeats many super k-mers verbatim. A repeat
+/// adds nothing to the distinct k-mers its bin yields, only bytes to write and
+/// k-mers to sort and deduplicate in phase 3.
+#[derive(Default)]
+struct RoutedSuperkmers {
+    /// Distinct packed records (length prefix + packed bases), back to back.
+    records: Vec<u8>,
+    /// XXH3 digest of a record -> its offset in `records`.
+    index: HashMap<u64, usize, BuildNoHashHasher<u64>>,
+}
+
+impl RoutedSuperkmers {
+    /// Record `record` and report whether it is new. Repeats are recognized
+    /// by content, never by digest alone: on a digest collision between
+    /// different records the second is simply reported as new.
+    fn insert(&mut self, record: &[u8]) -> bool {
+        match self.index.entry(xxhash_rust::xxh3::xxh3_64(record)) {
+            Entry::Occupied(seen) => {
+                let start = *seen.get();
+                self.records.get(start..start + record.len()) != Some(record)
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(self.records.len());
+                self.records.extend_from_slice(record);
+                true
+            }
+        }
+    }
+}
+
+/// Pack an N-free ASCII segment to 2-bit and append to the bin buffer, unless
+/// this task has already routed the identical super k-mer.
 fn pack_and_buffer(
     ascii: &[u8],
     bin: usize,
     buffers: &mut [Vec<u8>],
     writers: &[Mutex<BinWriter>],
     pack_buf: &mut Vec<u8>,
+    routed: &mut RoutedSuperkmers,
 ) {
     let base_len = ascii.len() as u16;
     let packed_bytes = ascii.len().div_ceil(4);
 
-    // Pack into reusable buffer.
+    // Pack the record (length + packed data) into the reusable buffer.
     pack_buf.clear();
-    pack_buf.resize(packed_bytes, 0);
+    pack_buf.extend_from_slice(&base_len.to_le_bytes());
+    pack_buf.resize(2 + packed_bytes, 0);
+    let packed = &mut pack_buf[2..];
     for (i, &ch) in ascii.iter().enumerate() {
         let base = Base::map_base(ch) as u8;
-        pack_buf[i / 4] |= base << (6 - 2 * (i % 4));
+        packed[i / 4] |= base << (6 - 2 * (i % 4));
+    }
+    if !routed.insert(pack_buf) {
+        return;
     }
 
-    // Append length + packed data to bin buffer.
+    // Append the record to the bin buffer.
     let buf = &mut buffers[bin];
-    buf.extend_from_slice(&base_len.to_le_bytes());
     buf.extend_from_slice(pack_buf);
 
     // Flush if buffer exceeds threshold.
@@ -295,6 +354,20 @@ impl BinWriter {
         self.writer.flush()?;
         Ok(())
     }
+}
+
+/// Iterate the packed super k-mers of a bin file's contents, as
+/// `(base_count, packed_bytes)` (the format [`BinReader`] reads). A truncated
+/// trailing record ends the iteration.
+pub fn packed_superkmers(data: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        let (len, tail) = rest.split_first_chunk::<2>()?;
+        let base_count = u16::from_le_bytes(*len) as usize;
+        let packed = tail.get(..base_count.div_ceil(4))?;
+        rest = &tail[packed.len()..];
+        Some((base_count, packed))
+    })
 }
 
 /// Reader for a single bin's packed super k-mers.

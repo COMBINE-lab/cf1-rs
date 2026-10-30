@@ -8,7 +8,7 @@ cf1-rs builds a compacted de Bruijn graph from reference sequences (genomes, tra
 
 1. **Minimizer counting** — SIMD-accelerated canonical minimizer extraction
 2. **Super k-mer routing** — Parallel partitioning of sequences into minimizer-based bins using 2-bit packed encoding
-3. **MPHF construction** — Global minimal perfect hash function via fingerprint-based hashing (BBHash), with parallel multi-threaded construction from disk
+3. **MPHF construction** — Global minimal perfect hash function ([PHastR](https://docs.rs/sux) from `sux`), built in parallel from the distinct k-mers in memory or, for large inputs, by streaming them once into an offline construction
 4. **DFA classification** — Lock-free vertex classification using atomic compare-and-swap on a compact state vector
 5. **Unitig extraction** — Parallel traversal and output in GFA-reduced format
 
