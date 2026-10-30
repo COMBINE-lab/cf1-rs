@@ -43,7 +43,8 @@ impl AtomicStateVector {
 
     /// Hint the CPU to start loading the word holding state `i`, so that a later
     /// [`get`](Self::get) or [`compare_and_swap`](Self::compare_and_swap) finds
-    /// it in cache. Purely a performance hint; a no-op off x86-64.
+    /// it in cache. Purely a performance hint (x86-64 and aarch64; a no-op
+    /// elsewhere).
     #[inline]
     pub fn prefetch(&self, i: usize) {
         debug_assert!(i < self.len);
@@ -55,7 +56,19 @@ impl AtomicStateVector {
             let word = self.data.as_ptr().add(i / Self::STATES_PER_WORD);
             _mm_prefetch::<_MM_HINT_T0>(word.cast::<i8>());
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: `prfm` only hints the cache hierarchy; it never faults, even
+        // for an invalid address, reads and writes nothing architecturally, and
+        // the pointer here is in bounds anyway.
+        unsafe {
+            let word = self.data.as_ptr().add(i / Self::STATES_PER_WORD);
+            core::arch::asm!(
+                "prfm pldl1keep, [{0}]",
+                in(reg) word,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let _ = i;
     }
 
