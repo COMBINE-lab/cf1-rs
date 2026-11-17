@@ -176,3 +176,131 @@ fn build_result(
         untiled_seqs,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tiny deterministic generator (xorshift64*).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn bases(&mut self, len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|_| b"ACGT"[(self.next() & 3) as usize])
+                .collect()
+        }
+    }
+
+    fn revcomp(seq: &[u8]) -> Vec<u8> {
+        seq.iter()
+            .rev()
+            .map(|&b| crate::dna::complement_char(b))
+            .collect()
+    }
+
+    /// Every reference is spelled exactly by its tiling (consecutive unitigs
+    /// overlapping by k - 1 bases), tilings are in input order, and every
+    /// unitig is written once. The input looks like a transcriptome — genes
+    /// whose isoforms share exons, adjacent in the file — and spans several
+    /// phase-5 batches.
+    #[test]
+    fn tilings_spell_the_references() {
+        let k = 31;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut total = 0;
+        while total < 2 * crate::batch::BATCH_BASES {
+            let gene = refs.len();
+            let exons: Vec<Vec<u8>> = (0..6)
+                .map(|_| {
+                    let len = 40 + (rng.next() % 300) as usize;
+                    rng.bases(len)
+                })
+                .collect();
+            for iso in 0..4 {
+                let mut seq = Vec::new();
+                for (e, exon) in exons.iter().enumerate() {
+                    // Each isoform skips a different exon (or none).
+                    if e != iso + 1 {
+                        seq.extend_from_slice(exon);
+                    }
+                }
+                if iso == 3 {
+                    seq = revcomp(&seq);
+                }
+                total += seq.len();
+                refs.push((format!("g{gene}_i{iso}"), seq));
+            }
+        }
+        // A reference shorter than k gets no tiling line.
+        refs.push(("short".to_string(), b"ACGTACGT".to_vec()));
+
+        let dir = std::env::temp_dir().join(format!("cf1_tiling_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fasta = dir.join("refs.fa");
+        let mut text = Vec::new();
+        for (name, seq) in &refs {
+            text.extend_from_slice(format!(">{name}\n").as_bytes());
+            text.extend_from_slice(seq);
+            text.push(b'\n');
+        }
+        std::fs::write(&fasta, text).unwrap();
+
+        let result = cf_build()
+            .input(CfInput::Files(vec![fasta]))
+            .output_prefix(dir.join("out"))
+            .k(k)
+            .threads(4)
+            .work_dir(dir.clone())
+            .synchronize_output(true)
+            .call()
+            .unwrap();
+
+        let segs = std::fs::read_to_string(&result.seg_file).unwrap();
+        let mut unitigs = std::collections::HashMap::new();
+        for line in segs.lines() {
+            let (id, seq) = line.split_once('\t').unwrap();
+            assert!(
+                unitigs
+                    .insert(id.to_string(), seq.as_bytes().to_vec())
+                    .is_none()
+            );
+        }
+        assert_eq!(unitigs.len() as u64, result.unitig_count);
+
+        let tilings = std::fs::read_to_string(&result.seq_file).unwrap();
+        let long_refs: Vec<_> = refs.iter().filter(|(_, s)| s.len() >= k).collect();
+        assert_eq!(tilings.lines().count(), long_refs.len());
+        for (line, (name, seq)) in tilings.lines().zip(long_refs) {
+            let (header, tiles) = line.split_once('\t').unwrap();
+            assert_eq!(header, format!("Reference:1_Sequence:{name}"));
+            let mut spelled: Vec<u8> = Vec::new();
+            for tile in tiles.split(' ') {
+                let (id, dir) = tile.split_at(tile.len() - 1);
+                let unitig = &unitigs[id];
+                let oriented = if dir == "+" {
+                    unitig.clone()
+                } else {
+                    revcomp(unitig)
+                };
+                if spelled.is_empty() {
+                    spelled = oriented;
+                } else {
+                    assert_eq!(spelled[spelled.len() - (k - 1)..], oriented[..k - 1]);
+                    spelled.extend_from_slice(&oriented[k - 1..]);
+                }
+            }
+            assert!(
+                spelled == *seq,
+                "{name}: tiling does not spell the reference"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
