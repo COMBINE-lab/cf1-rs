@@ -123,7 +123,12 @@ where
         );
 
         // Reserves address space only: pages are committed as keys are written.
-        let mut keys: Vec<KmerKey<K>> = Vec::with_capacity(clone_threshold);
+        // The reservation stays at least DEFAULT_CLONE_THRESHOLD keys even under
+        // a smaller budget: a smaller (still multi-GB) block may be served by
+        // the allocator from committed memory (e.g. a mimalloc arena) instead of
+        // a fresh, lazily committed mapping, which raised the peak RSS.
+        let mut keys: Vec<KmerKey<K>> =
+            Vec::with_capacity(clone_threshold.max(DEFAULT_CLONE_THRESHOLD));
         let mut per_bin_counts: Vec<usize> = Vec::with_capacity(num_bins);
         let bins: Vec<usize> = (0..num_bins).collect();
         let mut waves = bins.chunks(2 * rayon::current_num_threads());
