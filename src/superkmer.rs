@@ -289,9 +289,14 @@ fn pack_and_buffer(
     pack_buf.extend_from_slice(&base_len.to_le_bytes());
     pack_buf.resize(2 + packed_bytes, 0);
     let packed = &mut pack_buf[2..];
-    for (i, &ch) in ascii.iter().enumerate() {
-        let base = Base::map_base(ch) as u8;
-        packed[i / 4] |= base << (6 - 2 * (i % 4));
+    // Four bases per byte, most significant first.
+    let code = |ch: u8| Base::map_base(ch) as u8;
+    let (quads, rest) = ascii.as_chunks::<4>();
+    for (byte, q) in packed.iter_mut().zip(quads) {
+        *byte = code(q[0]) << 6 | code(q[1]) << 4 | code(q[2]) << 2 | code(q[3]);
+    }
+    for (i, &ch) in rest.iter().enumerate() {
+        packed[packed_bytes - 1] |= code(ch) << (6 - 2 * i);
     }
     if !routed.insert(pack_buf) {
         return;
