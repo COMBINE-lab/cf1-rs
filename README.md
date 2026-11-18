@@ -55,11 +55,19 @@ cf1-rs build -s genome.fa.gz -k 31 -t 8 -o output/k31_dbg \
 | `-o` | Output file prefix | — |
 | `-f` | Output format (0=FASTA, 1=GFA1, 2=GFA2, 3=GFA-reduced) | 3 |
 | `-w` | Working directory for temporary files | output dir |
-| `--memory-budget` | Memory budget in GB for MPHF construction | 4.0 |
+| `--memory-budget` | Soft MPHF construction budget in GiB; not a process RSS limit | 4.0 |
 | `--track-short-seqs` | Report sequences shorter than k | off |
 | `--poly-N-stretch` | Handle poly-N gaps in tiling output | off |
 | `--collate-output-in-mem` | Buffer output per-thread for ordered writes | off |
 | `--num-bins` | Number of minimizer partition bins | 128 |
+
+The memory setting selects between in-memory and offline MPHF construction;
+it is not a limit on total resident memory. The offline builder has about
+256 MiB of fixed buffers, so values below 0.25 GiB (including zero) use that
+floor when choosing a regime and emit a warning. This avoids making a small
+input use more memory by forcing it into offline construction. Larger inputs
+can still require streaming, temporary disk space, and more than the requested
+memory for deduplication, retained keys or other pipeline phases.
 
 ### Output
 

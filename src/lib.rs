@@ -69,7 +69,10 @@ pub struct CfBuildResult {
 /// - `threads` — number of worker threads (default: 1)
 /// - `work_dir` — directory for temporary files (default: parent of `output_prefix`)
 /// - `num_bins` — number of minimizer bins (default: 128)
-/// - `memory_budget_gb` — memory budget for MPHF construction in GB (default: 4.0)
+/// - `memory_budget_gb` — soft MPHF construction budget in GiB (default: 4.0).
+///   Values below 0.25 GiB use the offline buffer working-set floor for regime
+///   selection. This is not a bound on process RSS; other phases and
+///   deduplication can exceed it.
 #[bon::builder]
 pub fn cf_build(
     input: CfInput,

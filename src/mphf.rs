@@ -10,7 +10,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use sux::func::{PHastR, PHastRBuilder};
 use sux::utils::ToSig;
-use tracing::info;
+use tracing::{info, warn};
 
 /// The MPHF: sux's PHastR with its default parameters (8-bit seeds, four
 /// layouts, slices of length 1024, expected bucket size 4.25; about 1.94
@@ -56,16 +56,30 @@ where
     /// Each bin is deduplicated independently, in parallel waves of bins
     /// (canonical minimizers guarantee no cross-bin duplicates); see
     /// [`build_with_clone_threshold`](Self::build_with_clone_threshold) for
-    /// how the keys reach the MPHF construction.
+    /// how the keys reach the MPHF construction. This is a soft budget for
+    /// selecting the construction regime, not a bound on process RSS. Budgets
+    /// below the offline buffer working set are raised to that floor: streaming
+    /// a small input must not use more memory than retaining its keys. Above the
+    /// resulting key threshold (capped at [`DEFAULT_CLONE_THRESHOLD`]), keys are
+    /// streamed. Deduplication, retained keys and other phases can exceed the
+    /// requested budget.
     pub fn build(
         partitioning: &Partitioning,
         work_dir: &Path,
-        _memory_budget_bytes: usize,
+        memory_budget_bytes: usize,
     ) -> anyhow::Result<Self>
     where
         <Kmer<K> as KmerBits>::Storage: RadixSortDedup,
     {
-        Self::build_with_clone_threshold(partitioning, work_dir, DEFAULT_CLONE_THRESHOLD)
+        let threshold = clone_threshold_for_budget::<K>(memory_budget_bytes);
+        if memory_budget_bytes < OFFLINE_BUFFER_BYTES {
+            warn!(
+                memory_budget_bytes,
+                offline_buffer_bytes = OFFLINE_BUFFER_BYTES,
+                "MPHF budget is below the offline buffer working set; using that floor for regime selection (not a process memory limit)"
+            );
+        }
+        Self::build_with_clone_threshold(partitioning, work_dir, threshold)
     }
 
     /// Build MPHF with an explicit `clone_threshold`.
@@ -119,7 +133,12 @@ where
         );
 
         // Reserves address space only: pages are committed as keys are written.
-        let mut keys: Vec<KmerKey<K>> = Vec::with_capacity(clone_threshold);
+        // The reservation stays at least DEFAULT_CLONE_THRESHOLD keys even under
+        // a smaller budget: a smaller (still multi-GB) block may be served by
+        // the allocator from committed memory (e.g. a mimalloc arena) instead of
+        // a fresh, lazily committed mapping, which raised the peak RSS.
+        let mut keys: Vec<KmerKey<K>> =
+            Vec::with_capacity(clone_threshold.max(DEFAULT_CLONE_THRESHOLD));
         let mut per_bin_counts: Vec<usize> = Vec::with_capacity(num_bins);
         let bins: Vec<usize> = (0..num_bins).collect();
         let mut waves = bins.chunks(2 * rayon::current_num_threads());
@@ -248,6 +267,32 @@ where
 /// Default [`Mphf::build_with_clone_threshold`] threshold: up to this many
 /// distinct k-mers the MPHF is built in memory.
 pub const DEFAULT_CLONE_THRESHOLD: usize = 300_000_000;
+
+/// Estimated peak memory, in bytes per key beyond the k-mer itself, of the
+/// in-memory MPHF construction (PHastR needs about 10 bytes per key with one
+/// thread and 12 with eight or more).
+pub const IN_MEMORY_BYTES_PER_KEY: usize = 12;
+
+// Approximate fixed buffer working set of the default PHastR offline builder.
+// A smaller budget must not force a tiny input into this more expensive regime.
+const OFFLINE_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+
+/// Key threshold for a soft MPHF construction budget.
+///
+/// Estimate keys plus per-key construction memory, with a 256 MiB floor for the
+/// offline builder's fixed buffers, and cap at [`DEFAULT_CLONE_THRESHOLD`]. This
+/// avoids choosing offline construction when its fixed buffers alone exceed the
+/// estimated in-memory work. It does not bound deduplication or process RSS.
+pub fn clone_threshold_for_budget<const K: usize>(memory_budget_bytes: usize) -> usize
+where
+    Kmer<K>: KmerBits,
+{
+    let per_key = std::mem::size_of::<<Kmer<K> as KmerBits>::Storage>() + IN_MEMORY_BYTES_PER_KEY;
+    // A tiny requested budget must not select an offline path whose fixed
+    // buffers alone exceed the entire estimated in-memory construction.
+    let effective_budget = memory_budget_bytes.max(OFFLINE_BUFFER_BYTES);
+    (effective_budget / per_key).min(DEFAULT_CLONE_THRESHOLD)
+}
 
 /// Deduplicate the bins of `wave` in parallel, returning each bin's sorted
 /// distinct canonical k-mers.
@@ -660,6 +705,63 @@ where
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn budget_threshold_accounts_for_offline_buffers_and_key_width() {
+        for budget in [0, 1, 1024 * 1024, 100 * 1024 * 1024, OFFLINE_BUFFER_BYTES] {
+            assert_eq!(
+                clone_threshold_for_budget::<31>(budget),
+                OFFLINE_BUFFER_BYTES / 20
+            );
+            assert_eq!(
+                clone_threshold_for_budget::<63>(budget),
+                OFFLINE_BUFFER_BYTES / 28
+            );
+        }
+        let boundary64 = (OFFLINE_BUFFER_BYTES / 20 + 1) * 20;
+        assert_eq!(
+            clone_threshold_for_budget::<31>(boundary64 - 1),
+            boundary64 / 20 - 1
+        );
+        assert_eq!(
+            clone_threshold_for_budget::<31>(boundary64),
+            boundary64 / 20
+        );
+        let boundary128 = (OFFLINE_BUFFER_BYTES / 28 + 1) * 28;
+        assert_eq!(
+            clone_threshold_for_budget::<63>(boundary128 - 1),
+            boundary128 / 28 - 1
+        );
+        assert_eq!(
+            clone_threshold_for_budget::<63>(boundary128),
+            boundary128 / 28
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn budget_threshold_keeps_default_and_large_budget_limits() {
+        let four_gib = 4 * 1024 * 1024 * 1024;
+        assert_eq!(clone_threshold_for_budget::<31>(four_gib), 214_748_364);
+        assert_eq!(clone_threshold_for_budget::<63>(four_gib), 153_391_689);
+        for threshold in [
+            clone_threshold_for_budget::<31>(usize::MAX),
+            clone_threshold_for_budget::<63>(usize::MAX),
+        ] {
+            assert_eq!(threshold, DEFAULT_CLONE_THRESHOLD);
+        }
+    }
+
+    #[test]
+    fn small_budget_does_not_force_a_larger_offline_working_set() {
+        // An ~8-million-key input is larger than the old 0.1-GiB threshold,
+        // but cheaper to keep in memory than the offline buffers alone.
+        let keys = 8_000_000;
+        let budget = 100 * 1024 * 1024;
+        assert!(keys > budget / 20);
+        assert!(keys * 20 < OFFLINE_BUFFER_BYTES);
+        assert!(keys <= clone_threshold_for_budget::<31>(budget));
+    }
 
     /// A tiny deterministic generator (xorshift64*).
     struct Rng(u64);

@@ -63,8 +63,9 @@ pub enum Commands {
         #[arg(long = "num-bins", default_value = "128")]
         num_bins: usize,
 
-        /// Memory budget in GB for MPHF construction (determines how many k-mers
-        /// can be cached in RAM during construction)
+        /// Soft MPHF construction budget in GiB, not a process memory limit.
+        /// Values below 0.25 GiB use the offline buffer working-set floor when
+        /// choosing between in-memory and streaming construction.
         #[arg(long = "memory-budget", default_value = "4.0")]
         memory_budget_gb: f64,
 
