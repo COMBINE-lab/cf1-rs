@@ -204,6 +204,105 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn tilings_preserve_cached_runs_and_placeholder_gaps_across_files() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let shared = rng.bases(1000);
+        let mut gapped = b"NN".to_vec();
+        gapped.extend_from_slice(&shared[..400]);
+        gapped.extend_from_slice(b"NNRYACGTNN");
+        gapped.extend_from_slice(&shared[400..]);
+        gapped.extend_from_slice(b"NN");
+        let files = [
+            vec![
+                ("first", shared.clone()),
+                ("repeat", shared.clone()),
+                ("gapped", gapped),
+            ],
+            vec![
+                ("again", shared.clone()),
+                ("reverse", revcomp(&shared)),
+                ("all_n", vec![b'N'; 100]),
+                ("short", b"ACG".to_vec()),
+            ],
+        ];
+        for k in [31, 63] {
+            let dir =
+                std::env::temp_dir().join(format!("cf1_gap_test_{}_k{k}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let inputs: Vec<_> = files
+                .iter()
+                .enumerate()
+                .map(|(file_id, refs)| {
+                    let path = dir.join(format!("{file_id}.fa"));
+                    let mut text = Vec::new();
+                    for (name, seq) in refs {
+                        text.extend_from_slice(format!(">{name}\n").as_bytes());
+                        text.extend_from_slice(seq);
+                        text.push(b'\n');
+                    }
+                    std::fs::write(&path, text).unwrap();
+                    path
+                })
+                .collect();
+            let result = cf_build()
+                .input(CfInput::Files(inputs))
+                .output_prefix(dir.join("out"))
+                .k(k)
+                .threads(4)
+                .synchronize_output(true)
+                .call()
+                .unwrap();
+            let segments = std::fs::read_to_string(&result.seg_file).unwrap();
+            let mut unitigs = std::collections::HashMap::new();
+            for line in segments.lines() {
+                let (id, seq) = line.split_once('\t').unwrap();
+                assert!(unitigs.insert(id, seq.as_bytes()).is_none());
+            }
+            assert_eq!(unitigs.len() as u64, result.unitig_count);
+            let tilings = std::fs::read_to_string(&result.seq_file).unwrap();
+            let mut lines = tilings.lines();
+            for (file_id, refs) in files.iter().enumerate() {
+                for (name, seq) in refs.iter().filter(|(_, seq)| seq.len() >= k) {
+                    let (header, tiles) = lines.next().unwrap().split_once('\t').unwrap();
+                    assert_eq!(header, format!("Reference:{}_Sequence:{name}", file_id + 1));
+                    let mut cursor = 0;
+                    let mut overlap = false;
+                    let mut covered = vec![false; seq.len() - k + 1];
+                    for tile in tiles.split_whitespace() {
+                        if let Some(gap) = tile.strip_prefix('N') {
+                            cursor += gap.parse::<usize>().unwrap();
+                            overlap = false;
+                            continue;
+                        }
+                        let (id, direction) = tile.split_at(tile.len() - 1);
+                        let unitig = if direction == "+" {
+                            unitigs[id].to_vec()
+                        } else {
+                            revcomp(unitigs[id])
+                        };
+                        let start = if overlap { cursor - (k - 1) } else { cursor };
+                        assert_eq!(seq[start..start + unitig.len()], unitig, "{name}");
+                        for flag in &mut covered[start..start + unitig.len() - k + 1] {
+                            assert!(!*flag, "duplicate k-mer position in {name}");
+                            *flag = true;
+                        }
+                        cursor = start + unitig.len();
+                        overlap = true;
+                    }
+                    for (pos, &present) in covered.iter().enumerate() {
+                        let valid = seq[pos..pos + k]
+                            .iter()
+                            .all(|&base| !crate::dna::is_placeholder(base));
+                        assert_eq!(present, valid, "{name} position {pos}");
+                    }
+                }
+            }
+            assert!(lines.next().is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     /// Every reference is spelled exactly by its tiling (consecutive unitigs
     /// overlapping by k - 1 bases), tilings are in input order, and every
     /// unitig is written once. The input looks like a transcriptome — genes
@@ -238,6 +337,16 @@ mod tests {
                 refs.push((format!("g{gene}_i{iso}"), seq));
             }
         }
+        // Flush a small-reference batch around a large, chunked reference.
+        // Repeated forward/reverse references on either side exercise both walks.
+        let shared = rng.bases(2000);
+        refs.push(("before_large".to_string(), shared.clone()));
+        refs.push(("large".to_string(), rng.bases(4_000_037)));
+        refs.push(("after_large".to_string(), shared));
+        refs.push((
+            "after_large_rc".to_string(),
+            revcomp(&refs[refs.len() - 1].1),
+        ));
         // A reference shorter than k gets no tiling line.
         refs.push(("short".to_string(), b"ACGTACGT".to_vec()));
 
