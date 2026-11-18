@@ -142,6 +142,8 @@ where
     /// Next buffered k-mer to hand out; `buf[head..len]` are still pending.
     head: usize,
     len: usize,
+    /// Most k-mers buffered by the next [`fill`](Self::fill).
+    limit: usize,
 }
 
 impl<'a, const K: usize> AnnotatedRun<'a, K>
@@ -154,6 +156,28 @@ where
         start: usize,
         mphf: &'a crate::mphf::Mphf<K>,
         states: &'a crate::state_vector::AtomicStateVector,
+    ) -> Self {
+        Self::with_first_batch(seq, start, mphf, states, RUN_BATCH)
+    }
+
+    /// Like [`new`](Self::new), but resolving only the k-mer at `start` up
+    /// front, for a caller likely to abandon the run right after it: later
+    /// k-mers are resolved in full batches, as with `new`.
+    pub fn new_lazy(
+        seq: &'a [u8],
+        start: usize,
+        mphf: &'a crate::mphf::Mphf<K>,
+        states: &'a crate::state_vector::AtomicStateVector,
+    ) -> Self {
+        Self::with_first_batch(seq, start, mphf, states, 1)
+    }
+
+    fn with_first_batch(
+        seq: &'a [u8],
+        start: usize,
+        mphf: &'a crate::mphf::Mphf<K>,
+        states: &'a crate::state_vector::AtomicStateVector,
+        first_batch: usize,
     ) -> Self {
         let first = AnnotatedKmer {
             directed: DirectedKmer::new(Kmer::<K>::from_ascii(seq, start)),
@@ -168,6 +192,7 @@ where
             buf: [first; RUN_BATCH],
             head: 0,
             len: 1,
+            limit: first_batch,
         };
         run.fill(1);
         run
@@ -187,6 +212,7 @@ where
             self.buf[0].idx += 1;
             self.len = 1;
             self.head = 0;
+            self.limit = RUN_BATCH;
             self.fill(1);
         }
         let kmer = self.buf[self.head];
@@ -199,7 +225,7 @@ where
     /// from `buf[from - 1]` on.
     fn fill(&mut self, from: usize) {
         let resolve_from = from - 1;
-        while self.len < RUN_BATCH {
+        while self.len < self.limit {
             let prev = self.buf[self.len - 1];
             let next_pos = prev.idx + K;
             if next_pos >= self.seq.len() || crate::dna::is_placeholder(self.seq[next_pos]) {

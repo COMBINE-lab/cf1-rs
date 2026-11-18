@@ -1,13 +1,15 @@
 use crate::batch::{BATCH_BASES, SeqBatch};
 use crate::budget::InFlightBudget;
 use crate::directed_kmer::{AnnotatedKmer, AnnotatedRun, Direction, FWD};
-use crate::dna::{complement_char, is_placeholder, to_upper};
+use crate::dna::{complement_char, contains_non_acgt, is_placeholder, to_upper};
 use crate::kmer::{Kmer, KmerBits};
 use crate::mphf::Mphf;
 use crate::params::Params;
 use crate::state::StateClass;
 use crate::state_vector::AtomicStateVector;
 use rayon::prelude::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Mutex;
 use tracing::info;
@@ -228,6 +230,7 @@ where
     // transcriptome has hundreds of thousands of them, and a task per sequence
     // paid for its own 4 MB segment buffer and for five lock acquisitions.
     let tile_batch = |batch: TilingBatch| {
+        let walked = WalkedUnitigs::new();
         let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
         let mut tiles = Vec::new();
         let mut local_meta = UnipathsMeta::new();
@@ -242,6 +245,7 @@ where
                 &mut seg_buf,
                 K,
                 &mut local_meta,
+                &walked,
             );
             append_tiling::<K>(&mut tiles, batch.ref_id, name, &unitigs, poly_n_stretch);
             if unitigs.is_empty() {
@@ -328,6 +332,9 @@ where
                 let chunk_results: Vec<(Vec<OrientedUnitig>, UnipathsMeta)> = chunks
                     .into_par_iter()
                     .map(|(chunk_start, chunk_right_end)| {
+                        // Large sequences benefit from the original batched walk;
+                        // the cache targets reuse among small references in a batch.
+                        let walked = WalkedUnitigs::disabled();
                         let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
                         let mut local_meta = UnipathsMeta::new();
                         let unitigs = extract_unitigs_from_chunk::<K>(
@@ -341,6 +348,7 @@ where
                             &mut seg_buf,
                             K,
                             &mut local_meta,
+                            &walked,
                         );
                         if !seg_buf.is_empty() {
                             seg_writer.lock().unwrap().write_all(&seg_buf).ok();
@@ -393,6 +401,96 @@ where
     );
 
     Ok((result, untiled_seqs))
+}
+
+/// The unitigs phase 5 has already walked, by their first k-mer.
+///
+/// A unitig is a path of the graph that does not branch, so a reference that
+/// starts it (in a given direction) runs through all of its k-mers, unless it
+/// ends or hits a placeholder first: once a unitig has been walked, any later
+/// reference starting it can jump straight to its last k-mer, without
+/// resolving the k-mers in between through the MPHF. Transcript isoforms often
+/// reuse whole unitigs. Keep this cache within a small-reference batch: a shared
+/// cache adds synchronization and retains entries even when they are never reused.
+/// Large-reference chunks use the original batched walk. The jump is taken only
+/// if the reference holds the whole unitig and the k-mer it lands on is the
+/// unitig's recorded last k-mer.
+struct WalkedUnitigs {
+    /// `hash << 1 | direction` of a unitig's first k-mer -> (number of
+    /// k-mers, MPHF index of the last k-mer). This table belongs to one
+    /// small-reference batch and is never shared across worker threads.
+    entries: RefCell<HashMap<u64, (usize, u64)>>,
+    enabled: bool,
+}
+
+impl WalkedUnitigs {
+    // Short jumps do not amortize the cache lookup and endpoint checks.
+    const MIN_CACHED_KMERS: usize = 16;
+
+    fn new() -> Self {
+        WalkedUnitigs {
+            entries: RefCell::default(),
+            enabled: true,
+        }
+    }
+
+    fn disabled() -> Self {
+        WalkedUnitigs {
+            entries: RefCell::default(),
+            enabled: false,
+        }
+    }
+
+    #[inline]
+    fn key<const K: usize>(first: &AnnotatedKmer<K>) -> u64
+    where
+        Kmer<K>: KmerBits,
+    {
+        first.hash << 1 | first.dir() as u64
+    }
+
+    /// Record the unitig walked from `first` to `last`.
+    fn record<const K: usize>(&self, first: &AnnotatedKmer<K>, last: &AnnotatedKmer<K>)
+    where
+        Kmer<K>: KmerBits,
+    {
+        if !self.enabled || last.idx - first.idx < Self::MIN_CACHED_KMERS - 1 {
+            return;
+        }
+        let key = Self::key(first);
+        let len = last.idx - first.idx + 1;
+        self.entries
+            .borrow_mut()
+            .entry(key)
+            .or_insert((len, last.hash));
+    }
+
+    /// The last k-mer of the unitig starting at `first` in `seq`, if that
+    /// unitig has been walked and lies whole in `seq`.
+    fn last_kmer<const K: usize>(
+        &self,
+        seq: &[u8],
+        first: &AnnotatedKmer<K>,
+        mphf: &Mphf<K>,
+        states: &AtomicStateVector,
+    ) -> Option<AnnotatedKmer<K>>
+    where
+        Kmer<K>: KmerBits,
+    {
+        if !self.enabled {
+            return None;
+        }
+        let key = Self::key(first);
+        let (len, last_hash) = *self.entries.borrow().get(&key)?;
+        let last = first.idx + len - 1;
+        let span = seq.get(first.idx..last + K)?;
+        if contains_non_acgt(span) {
+            return None;
+        }
+        let last_kmer =
+            AnnotatedKmer::<K>::new(Kmer::<K>::from_ascii(seq, last), last, mphf, states);
+        (last_kmer.hash == last_hash).then_some(last_kmer)
+    }
 }
 
 /// Small sequences of one input file, tiled by a single phase-5 task.
@@ -477,6 +575,7 @@ fn extract_unitigs_from_seq<const K: usize>(
     seg_buf: &mut Vec<u8>,
     k: usize,
     meta: &mut UnipathsMeta,
+    walked: &WalkedUnitigs,
 ) -> Vec<OrientedUnitig>
 where
     Kmer<K>: KmerBits,
@@ -504,6 +603,7 @@ where
             k,
             &mut unitigs,
             meta,
+            walked,
         );
     }
 
@@ -556,6 +656,7 @@ fn extract_unitigs_from_chunk<const K: usize>(
     seg_buf: &mut Vec<u8>,
     k: usize,
     meta: &mut UnipathsMeta,
+    walked: &WalkedUnitigs,
 ) -> Vec<OrientedUnitig>
 where
     Kmer<K>: KmerBits,
@@ -582,6 +683,7 @@ where
             k,
             &mut unitigs,
             meta,
+            walked,
         );
         if kmer_idx > chunk_right_end {
             break; // completed a unitig that spanned the chunk boundary
@@ -624,13 +726,18 @@ fn output_unitigs_contiguous<const K: usize>(
     k: usize,
     unitigs: &mut Vec<OrientedUnitig>,
     meta: &mut UnipathsMeta,
+    walked: &WalkedUnitigs,
 ) -> usize
 where
     Kmer<K>: KmerBits,
 {
     let mut kmer_idx = start_idx;
 
-    let mut run = AnnotatedRun::<K>::new(seq, kmer_idx, mphf, states);
+    let mut run = if walked.enabled {
+        AnnotatedRun::<K>::new_lazy(seq, kmer_idx, mphf, states)
+    } else {
+        AnnotatedRun::<K>::new(seq, kmer_idx, mphf, states)
+    };
     let mut curr_kmer = run.next_kmer();
 
     // Isolated k-mer.
@@ -668,57 +775,70 @@ where
             return kmer_idx + K;
         }
 
-        let mut next_kmer = run.next_kmer();
-
-        let mut on_unipath = false;
         let mut unipath_start_kmer = curr_kmer;
-        #[allow(unused_assignments)]
-        let mut prev_kmer = curr_kmer;
-
-        if no_left {
-            on_unipath = true;
-            unipath_start_kmer = curr_kmer;
-        } else {
+        let mut prev_kmer;
+        let mut on_unipath = no_left || {
             prev_kmer = AnnotatedKmer::<K>::new(
                 Kmer::<K>::from_ascii(seq, kmer_idx - 1),
                 kmer_idx,
                 mphf,
                 states,
             );
-            if is_unipath_start(
+            is_unipath_start(
                 curr_kmer.state_class,
                 curr_kmer.dir(),
                 prev_kmer.state_class,
                 prev_kmer.dir(),
-            ) {
-                on_unipath = true;
-                unipath_start_kmer = curr_kmer;
-            }
-        }
-
-        if on_unipath
-            && is_unipath_end(
-                curr_kmer.state_class,
-                curr_kmer.dir(),
-                next_kmer.state_class,
-                next_kmer.dir(),
             )
+        };
+
+        let mut next_kmer;
+        if let Some(last_kmer) = on_unipath
+            .then(|| {
+                jump_walked_unitig::<K>(
+                    seq, &curr_kmer, walked, mphf, states, seg_writer, seg_buf, k, unitigs, meta,
+                )
+            })
+            .flatten()
         {
-            output_gfa_unitig::<K>(
-                seq,
-                &unipath_start_kmer,
-                &curr_kmer,
-                states,
-                seg_writer,
-                seg_buf,
-                k,
-                unitigs,
-                meta,
-            );
+            // A unitig already walked (see [`WalkedUnitigs`]): resume past its
+            // last k-mer exactly as the walk would have.
+            let last = last_kmer.idx;
+            if last + K == seq_len || is_placeholder(seq[last + K]) {
+                return last + K;
+            }
+            run = AnnotatedRun::<K>::new_lazy(seq, last + 1, mphf, states);
+            next_kmer = run.next_kmer();
+            curr_kmer = last_kmer;
             on_unipath = false;
+            kmer_idx = last + 1;
+        } else {
+            next_kmer = run.next_kmer();
+            if on_unipath
+                && is_unipath_end(
+                    curr_kmer.state_class,
+                    curr_kmer.dir(),
+                    next_kmer.state_class,
+                    next_kmer.dir(),
+                )
+            {
+                output_gfa_unitig::<K>(
+                    seq,
+                    &unipath_start_kmer,
+                    &curr_kmer,
+                    states,
+                    seg_writer,
+                    seg_buf,
+                    k,
+                    unitigs,
+                    meta,
+                );
+                walked.record(&unipath_start_kmer, &curr_kmer);
+                on_unipath = false;
+            }
+            kmer_idx += 1;
         }
 
-        kmer_idx += 1;
         loop {
             if !on_unipath && kmer_idx > right_end {
                 break;
@@ -735,6 +855,22 @@ where
             ) {
                 on_unipath = true;
                 unipath_start_kmer = curr_kmer;
+
+                if let Some(last_kmer) = jump_walked_unitig::<K>(
+                    seq, &curr_kmer, walked, mphf, states, seg_writer, seg_buf, k, unitigs, meta,
+                ) {
+                    // As above.
+                    let last = last_kmer.idx;
+                    if last + K == seq_len || is_placeholder(seq[last + K]) {
+                        return last + K;
+                    }
+                    run = AnnotatedRun::<K>::new_lazy(seq, last + 1, mphf, states);
+                    next_kmer = run.next_kmer();
+                    curr_kmer = last_kmer;
+                    on_unipath = false;
+                    kmer_idx = last + 1;
+                    continue;
+                }
             }
 
             // No valid right neighbor.
@@ -751,6 +887,10 @@ where
                         unitigs,
                         meta,
                     );
+                    // A k-mer without a right neighbor is a unitig end (phase 4
+                    // makes that side of its state multi), so this walk is a
+                    // whole unitig.
+                    walked.record(&unipath_start_kmer, &curr_kmer);
                 }
                 return kmer_idx + K;
             }
@@ -776,6 +916,7 @@ where
                     unitigs,
                     meta,
                 );
+                walked.record(&unipath_start_kmer, &curr_kmer);
                 on_unipath = false;
             }
 
@@ -784,6 +925,32 @@ where
     }
 
     kmer_idx + K
+}
+
+/// If the unitig starting at `first` has already been walked and lies whole
+/// in `seq` (see [`WalkedUnitigs`]), output it and return its last k-mer.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn jump_walked_unitig<const K: usize>(
+    seq: &[u8],
+    first: &AnnotatedKmer<K>,
+    walked: &WalkedUnitigs,
+    mphf: &Mphf<K>,
+    states: &AtomicStateVector,
+    seg_writer: &Mutex<std::io::BufWriter<std::fs::File>>,
+    seg_buf: &mut Vec<u8>,
+    k: usize,
+    unitigs: &mut Vec<OrientedUnitig>,
+    meta: &mut UnipathsMeta,
+) -> Option<AnnotatedKmer<K>>
+where
+    Kmer<K>: KmerBits,
+{
+    let last_kmer = walked.last_kmer(seq, first, mphf, states)?;
+    output_gfa_unitig::<K>(
+        seq, first, &last_kmer, states, seg_writer, seg_buf, k, unitigs, meta,
+    );
+    Some(last_kmer)
 }
 
 /// Output a single GFA unitig (segment) and record it.
@@ -927,7 +1094,95 @@ pub fn write_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::directed_kmer::DirectedKmer;
     use crate::params::Params;
+
+    fn annotated(idx: usize, hash: u64) -> AnnotatedKmer<31> {
+        AnnotatedKmer {
+            directed: DirectedKmer::new(Kmer::from_ascii(&[b'A'; 31], 0)),
+            idx,
+            hash,
+            state_class: StateClass::SingleInSingleOut,
+        }
+    }
+
+    #[test]
+    fn cache_skips_short_unitigs_and_large_reference_walks() {
+        let cache = WalkedUnitigs::new();
+        let first = annotated(10, 1);
+        cache.record(&first, &annotated(24, 2)); // 15 k-mers
+        assert!(cache.entries.borrow().is_empty());
+        cache.record(&first, &annotated(25, 2)); // 16 k-mers
+        assert_eq!(cache.entries.borrow()[&WalkedUnitigs::key(&first)], (16, 2));
+
+        let disabled = WalkedUnitigs::disabled();
+        disabled.record(&first, &annotated(100, 3));
+        assert!(disabled.entries.borrow().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn cache_preserves_lengths_wider_than_u32() {
+        let cache = WalkedUnitigs::new();
+        let first = annotated(0, 1);
+        let last = annotated(u32::MAX as usize, 2);
+        cache.record(&first, &last);
+        assert_eq!(
+            cache.entries.borrow()[&WalkedUnitigs::key(&first)],
+            (1usize << 32, 2)
+        );
+    }
+
+    #[test]
+    fn cached_jump_checks_bounds_placeholders_and_endpoint() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let seq: Vec<u8> = (0..200)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                b"ACGT"[(seed & 3) as usize]
+            })
+            .collect();
+        let keys: std::collections::BTreeSet<u64> = (0..=seq.len() - 31)
+            .map(|pos| Kmer::<31>::from_ascii(&seq, pos).canonical().bits)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("cf1_jump_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys");
+        let bytes: Vec<u8> = keys.iter().flat_map(|k| k.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).unwrap();
+        let mphf = Mphf::<31>::build_from_consolidated(&path, keys.len(), keys.len()).unwrap();
+        let states = AtomicStateVector::new(keys.len());
+        let first = AnnotatedKmer::new(Kmer::from_ascii(&seq, 10), 10, &mphf, &states);
+        let last = AnnotatedKmer::new(Kmer::from_ascii(&seq, 100), 100, &mphf, &states);
+        let cache = WalkedUnitigs::new();
+        cache.record(&first, &last);
+        assert_eq!(
+            cache.last_kmer(&seq, &first, &mphf, &states).unwrap().idx,
+            100
+        );
+        assert!(
+            cache
+                .last_kmer(&seq[..130], &first, &mphf, &states)
+                .is_none()
+        );
+        for placeholder in b"NnR" {
+            let mut gapped = seq.clone();
+            gapped[50] = *placeholder;
+            assert!(cache.last_kmer(&gapped, &first, &mphf, &states).is_none());
+        }
+        let other = AnnotatedKmer::new(Kmer::from_ascii(&seq, 120), 120, &mphf, &states);
+        assert_ne!(last.hash, other.hash);
+        let mut different_end = seq.clone();
+        different_end[100..131].copy_from_slice(&seq[120..151]);
+        assert!(
+            cache
+                .last_kmer(&different_end, &first, &mphf, &states)
+                .is_none()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn test_write_json_includes_untiled_seqs() {
