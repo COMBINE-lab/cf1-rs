@@ -1,3 +1,4 @@
+use crate::batch::{BATCH_BASES, SeqBatch};
 use crate::budget::InFlightBudget;
 use crate::directed_kmer::{AnnotatedKmer, AnnotatedRun, Direction, FWD};
 use crate::dna::{complement_char, is_placeholder, to_upper};
@@ -195,10 +196,85 @@ where
         pending: std::collections::HashMap::new(),
     });
 
+    let poly_n_stretch = params.poly_n_stretch;
+
+    // Write a finished run of tiling lines. When synchronizing, runs are put in a
+    // small reorder buffer keyed by `slot` (input order) and the longest
+    // contiguous prefix is flushed; `release_len` bases of in-flight budget are
+    // released only once the run is written, which bounds the buffer to the
+    // in-flight batches.
+    let emit = |slot: usize, tiles: Vec<u8>, release_len: usize| {
+        if synchronize {
+            let mut st = order_state.lock().unwrap();
+            st.pending.insert(slot, (tiles, release_len));
+            let mut n = st.next;
+            while let Some((t, len)) = st.pending.remove(&n) {
+                seq_writer.lock().unwrap().write_all(&t).ok();
+                if len > 0 {
+                    budget.release(len);
+                }
+                n += 1;
+            }
+            st.next = n;
+        } else {
+            seq_writer.lock().unwrap().write_all(&tiles).ok();
+            if release_len > 0 {
+                budget.release(release_len);
+            }
+        }
+    };
+
+    // Small sequences are batched (~4 Mbp per task, as in phases 1, 2 and 4): a
+    // transcriptome has hundreds of thousands of them, and a task per sequence
+    // paid for its own 4 MB segment buffer and for five lock acquisitions.
+    let tile_batch = |batch: TilingBatch| {
+        let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
+        let mut tiles = Vec::new();
+        let mut local_meta = UnipathsMeta::new();
+        let mut untiled = Vec::new();
+        for (seq, name) in batch.seqs.iter().zip(&batch.names) {
+            let unitigs = extract_unitigs_from_seq::<K>(
+                seq,
+                seq.len(),
+                mphf,
+                states,
+                &seg_writer,
+                &mut seg_buf,
+                K,
+                &mut local_meta,
+            );
+            append_tiling::<K>(&mut tiles, batch.ref_id, name, &unitigs, poly_n_stretch);
+            if unitigs.is_empty() {
+                untiled.push((name.clone(), seq.len()));
+            }
+        }
+        if !seg_buf.is_empty() {
+            seg_writer.lock().unwrap().write_all(&seg_buf).ok();
+        }
+        if !untiled.is_empty() {
+            untiled_seqs.lock().unwrap().extend(untiled);
+        }
+        global_meta.lock().unwrap().aggregate(&local_meta);
+        emit(batch.slot, tiles, batch.seqs.bases());
+    };
+
     rayon::in_place_scope(|s| {
-        let mut next_seq_idx: usize = 0;
+        // Input-order index of the next tiling run (a batch or a large sequence).
+        let mut next_slot: usize = 0;
+        let tile_batch = &tile_batch;
+        let spawn_batch = |batch: &mut TilingBatch, next_slot: &mut usize| {
+            if batch.names.is_empty() {
+                return;
+            }
+            let mut batch = std::mem::replace(batch, TilingBatch::new(batch.ref_id));
+            batch.slot = *next_slot;
+            *next_slot += 1;
+            budget.wait_and_acquire(batch.seqs.bases());
+            s.spawn(move |_| tile_batch(batch));
+        };
         for (file_idx, input_file) in params.input_files.iter().enumerate() {
             let ref_id = (file_idx + 1) as u64;
+            let mut batch = TilingBatch::new(ref_id);
             let mut reader =
                 needletail::parse_fastx_file(input_file).expect("failed to open FASTA file");
 
@@ -207,13 +283,11 @@ where
                 let seq = record.seq();
                 let seq_len = seq.len();
 
+                // Only sequences >= K get a tiling line, matching how the
+                // references are numbered downstream.
                 if seq_len < K {
                     continue;
                 }
-                // Input-order index of this reference (only sequences >= K get a
-                // tiling line, matching how the references are numbered downstream).
-                let seq_idx = next_seq_idx;
-                next_seq_idx += 1;
 
                 let seq_name = std::str::from_utf8(record.id())
                     .unwrap_or("")
@@ -222,176 +296,76 @@ where
                     .unwrap_or("")
                     .to_string();
 
-                let poly_n_stretch = params.poly_n_stretch;
-                let seg_writer = &seg_writer;
-                let seq_writer = &seq_writer;
-                let global_meta = &global_meta;
-                let untiled_seqs = &untiled_seqs;
-                let order_state = &order_state;
-                let budget = &budget;
-                // Sequences under 4 MB are copied and spawned async for
-                // between-sequence parallelism. Larger ones are processed
+                // Sequences under 4 MB are copied into a batch and spawned async
+                // for between-sequence parallelism. Larger ones are processed
                 // synchronously with zero copy.
                 const LARGE_SEQ_THRESHOLD: usize = 4_000_000;
 
-                // Closure to build the tiling line and emit output. `release_len`
-                // is the in-flight budget to release once this tiling is actually
-                // written (the small-sequence path passes its `seq_len`; the
-                // large-sequence path, which does not take a budget slot, passes 0).
-                let write_tiling = move |unitigs: &[OrientedUnitig],
-                                         local_meta: &UnipathsMeta,
-                                         release_len: usize| {
-                    let tiling_estimate = 64 + seq_name.len() + unitigs.len() * 14;
-                    let mut tiling = Vec::with_capacity(tiling_estimate);
-                    let mut ibuf = itoa::Buffer::new();
-
-                    tiling.extend_from_slice(b"Reference:");
-                    tiling.extend_from_slice(ibuf.format(ref_id).as_bytes());
-                    tiling.extend_from_slice(b"_Sequence:");
-                    tiling.extend_from_slice(seq_name.as_bytes());
-                    tiling.push(b'\t');
-
-                    if !unitigs.is_empty() {
-                        let first = &unitigs[0];
-
-                        if poly_n_stretch && first.start_kmer_idx > 0 {
-                            tiling.push(b'N');
-                            tiling.extend_from_slice(ibuf.format(first.start_kmer_idx).as_bytes());
-                            tiling.push(b' ');
-                        }
-
-                        tiling.extend_from_slice(ibuf.format(first.unitig_id).as_bytes());
-                        tiling.push(if first.dir == FWD { b'+' } else { b'-' });
-
-                        for i in 1..unitigs.len() {
-                            let left = &unitigs[i - 1];
-                            let right = &unitigs[i];
-
-                            if poly_n_stretch && (left.end_kmer_idx + 1) != right.start_kmer_idx {
-                                let nuc_gap =
-                                    right.start_kmer_idx as i64 - left.end_kmer_idx as i64;
-                                if nuc_gap >= (K as i64 + 1) {
-                                    let polyn_gap = nuc_gap as usize - K;
-                                    tiling.push(b' ');
-                                    tiling.push(b'N');
-                                    tiling.extend_from_slice(ibuf.format(polyn_gap).as_bytes());
-                                }
-                            }
-
-                            tiling.push(b' ');
-                            tiling.extend_from_slice(ibuf.format(right.unitig_id).as_bytes());
-                            tiling.push(if right.dir == FWD { b'+' } else { b'-' });
-                        }
-                    }
-
-                    tiling.push(b'\n');
-
-                    if unitigs.is_empty() {
-                        untiled_seqs
-                            .lock()
-                            .unwrap()
-                            .push((seq_name.clone(), seq_len));
-                    }
-                    if synchronize {
-                        // Buffer this tiling and flush the longest contiguous
-                        // prefix in input order, releasing each written sequence's
-                        // budget as it goes (bounding the buffer to in-flight count).
-                        let mut st = order_state.lock().unwrap();
-                        st.pending.insert(seq_idx, (tiling, release_len));
-                        let mut n = st.next;
-                        while let Some((t, len)) = st.pending.remove(&n) {
-                            seq_writer.lock().unwrap().write_all(&t).ok();
-                            if len > 0 {
-                                budget.release(len);
-                            }
-                            n += 1;
-                        }
-                        st.next = n;
-                    } else {
-                        seq_writer.lock().unwrap().write_all(&tiling).ok();
-                    }
-                    global_meta.lock().unwrap().aggregate(local_meta);
-                };
-
                 if seq_len < LARGE_SEQ_THRESHOLD {
-                    // Small sequence: copy and spawn async for between-sequence parallelism.
-                    budget.wait_and_acquire(seq_len);
-                    let seq_owned = seq.to_vec();
+                    batch.seqs.push(&seq);
+                    batch.names.push(seq_name);
+                    if batch.seqs.bases() >= BATCH_BASES {
+                        spawn_batch(&mut batch, &mut next_slot);
+                    }
+                    continue;
+                }
 
-                    s.spawn(move |_| {
+                // Earlier small sequences come first in the output order.
+                spawn_batch(&mut batch, &mut next_slot);
+
+                // Large sequence: copy + split into per-thread chunks + parallel extraction.
+                // Each chunk processes an equal share of k-mer positions.  The existing
+                // `output_unitigs_contiguous` loop naturally handles chunk boundaries: if it
+                // is mid-unitig at `chunk_right_end` it continues until that unitig ends;
+                // the next chunk then starts mid-sequence with `on_unipath = false` and
+                // advances silently past the in-progress unitig.  Result: each unitig
+                // appears in exactly one chunk's Vec<OrientedUnitig>.  Concatenating in
+                // order gives a tiling identical to the serial path.
+                let seq_owned = seq.to_vec();
+                let num_chunks = rayon::current_num_threads().max(1);
+                let chunks = compute_chunk_boundaries(seq_len, K, num_chunks);
+
+                let chunk_results: Vec<(Vec<OrientedUnitig>, UnipathsMeta)> = chunks
+                    .into_par_iter()
+                    .map(|(chunk_start, chunk_right_end)| {
                         let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
                         let mut local_meta = UnipathsMeta::new();
-
-                        let unitigs = extract_unitigs_from_seq::<K>(
+                        let unitigs = extract_unitigs_from_chunk::<K>(
                             &seq_owned,
                             seq_len,
+                            chunk_start,
+                            chunk_right_end,
                             mphf,
                             states,
-                            seg_writer,
+                            &seg_writer,
                             &mut seg_buf,
                             K,
                             &mut local_meta,
                         );
-
                         if !seg_buf.is_empty() {
                             seg_writer.lock().unwrap().write_all(&seg_buf).ok();
                         }
+                        (unitigs, local_meta)
+                    })
+                    .collect(); // preserves chunk order
 
-                        // In synchronize mode `write_tiling` releases the budget
-                        // when the tiling is actually written (release_len = seq_len);
-                        // otherwise release it here, on completion.
-                        write_tiling(&unitigs, &local_meta, seq_len);
-                        if !synchronize {
-                            budget.release(seq_len);
-                        }
-                    });
-                } else {
-                    // Large sequence: copy + split into per-thread chunks + parallel extraction.
-                    // Each chunk processes an equal share of k-mer positions.  The existing
-                    // `output_unitigs_contiguous` loop naturally handles chunk boundaries: if it
-                    // is mid-unitig at `chunk_right_end` it continues until that unitig ends;
-                    // the next chunk then starts mid-sequence with `on_unipath = false` and
-                    // advances silently past the in-progress unitig.  Result: each unitig
-                    // appears in exactly one chunk's Vec<OrientedUnitig>.  Concatenating in
-                    // order gives a tiling identical to the serial path.
-                    let seq_owned = seq.to_vec();
-                    let num_chunks = rayon::current_num_threads().max(1);
-                    let chunks = compute_chunk_boundaries(seq_len, K, num_chunks);
-
-                    let chunk_results: Vec<(Vec<OrientedUnitig>, UnipathsMeta)> = chunks
-                        .into_par_iter()
-                        .map(|(chunk_start, chunk_right_end)| {
-                            let mut seg_buf = Vec::with_capacity(SEG_BUFFER_THRESHOLD + 4096);
-                            let mut local_meta = UnipathsMeta::new();
-                            let unitigs = extract_unitigs_from_chunk::<K>(
-                                &seq_owned,
-                                seq_len,
-                                chunk_start,
-                                chunk_right_end,
-                                mphf,
-                                states,
-                                seg_writer,
-                                &mut seg_buf,
-                                K,
-                                &mut local_meta,
-                            );
-                            if !seg_buf.is_empty() {
-                                seg_writer.lock().unwrap().write_all(&seg_buf).ok();
-                            }
-                            (unitigs, local_meta)
-                        })
-                        .collect(); // preserves chunk order
-
-                    let mut all_unitigs: Vec<OrientedUnitig> = Vec::new();
-                    let mut local_meta = UnipathsMeta::new();
-                    for (u, m) in chunk_results {
-                        all_unitigs.extend(u);
-                        local_meta.aggregate(&m);
-                    }
-                    // Large sequences take no budget slot, so nothing to release.
-                    write_tiling(&all_unitigs, &local_meta, 0);
+                let mut all_unitigs: Vec<OrientedUnitig> = Vec::new();
+                let mut local_meta = UnipathsMeta::new();
+                for (u, m) in chunk_results {
+                    all_unitigs.extend(u);
+                    local_meta.aggregate(&m);
                 }
+                let mut tiles = Vec::new();
+                append_tiling::<K>(&mut tiles, ref_id, &seq_name, &all_unitigs, poly_n_stretch);
+                if all_unitigs.is_empty() {
+                    untiled_seqs.lock().unwrap().push((seq_name, seq_len));
+                }
+                global_meta.lock().unwrap().aggregate(&local_meta);
+                // Large sequences take no budget slot, so nothing to release.
+                emit(next_slot, tiles, 0);
+                next_slot += 1;
             }
+            spawn_batch(&mut batch, &mut next_slot);
         }
     });
 
@@ -419,6 +393,77 @@ where
     );
 
     Ok((result, untiled_seqs))
+}
+
+/// Small sequences of one input file, tiled by a single phase-5 task.
+struct TilingBatch {
+    seqs: SeqBatch,
+    names: Vec<String>,
+    ref_id: u64,
+    /// Position of this batch's tiling lines in the output order.
+    slot: usize,
+}
+
+impl TilingBatch {
+    fn new(ref_id: u64) -> Self {
+        TilingBatch {
+            seqs: SeqBatch::default(),
+            names: Vec::new(),
+            ref_id,
+            slot: 0,
+        }
+    }
+}
+
+/// Append the tiling line of a sequence (`Reference:<ref_id>_Sequence:<name>`,
+/// a tab, then its oriented unitigs, with `N<gap>` placeholders between them
+/// when `poly_n_stretch` is set) to `tiling`.
+fn append_tiling<const K: usize>(
+    tiling: &mut Vec<u8>,
+    ref_id: u64,
+    seq_name: &str,
+    unitigs: &[OrientedUnitig],
+    poly_n_stretch: bool,
+) {
+    let mut ibuf = itoa::Buffer::new();
+    tiling.reserve(64 + seq_name.len() + unitigs.len() * 14);
+
+    tiling.extend_from_slice(b"Reference:");
+    tiling.extend_from_slice(ibuf.format(ref_id).as_bytes());
+    tiling.extend_from_slice(b"_Sequence:");
+    tiling.extend_from_slice(seq_name.as_bytes());
+    tiling.push(b'\t');
+
+    if let Some(first) = unitigs.first() {
+        if poly_n_stretch && first.start_kmer_idx > 0 {
+            tiling.push(b'N');
+            tiling.extend_from_slice(ibuf.format(first.start_kmer_idx).as_bytes());
+            tiling.push(b' ');
+        }
+
+        tiling.extend_from_slice(ibuf.format(first.unitig_id).as_bytes());
+        tiling.push(if first.dir == FWD { b'+' } else { b'-' });
+
+        for pair in unitigs.windows(2) {
+            let (left, right) = (&pair[0], &pair[1]);
+
+            if poly_n_stretch && (left.end_kmer_idx + 1) != right.start_kmer_idx {
+                let nuc_gap = right.start_kmer_idx as i64 - left.end_kmer_idx as i64;
+                if nuc_gap >= (K as i64 + 1) {
+                    let polyn_gap = nuc_gap as usize - K;
+                    tiling.push(b' ');
+                    tiling.push(b'N');
+                    tiling.extend_from_slice(ibuf.format(polyn_gap).as_bytes());
+                }
+            }
+
+            tiling.push(b' ');
+            tiling.extend_from_slice(ibuf.format(right.unitig_id).as_bytes());
+            tiling.push(if right.dir == FWD { b'+' } else { b'-' });
+        }
+    }
+
+    tiling.push(b'\n');
 }
 
 /// Extract unitigs from a single sequence, buffering segment output.
