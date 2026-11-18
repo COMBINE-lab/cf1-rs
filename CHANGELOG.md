@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.6.1 — 2026-11-18
+
+Performance:
+
+- Batch small references during phase-5 output, amortizing buffer allocation
+  and synchronization while preserving ordered tilings (#4).
+- Reuse previously walked unitigs within each small-reference batch. Cache
+  only unitigs of at least 16 k-mers, store lengths as `usize`, and retain the
+  eager batched walk for large-reference chunks (#5).
+- Pack super k-mers four bases per output byte with the same representation
+  as before (#6).
+
+Memory-budget behavior:
+
+- Use the existing MPHF memory budget and key width to select in-memory or
+  streaming construction (#7). This is a soft construction budget in GiB,
+  not a bound on process RSS.
+- Account for the offline builder's approximately 256 MiB of fixed buffers.
+  Budgets below 0.25 GiB, including zero, use that floor for regime selection
+  and emit a warning, avoiding a slower and larger mode for small inputs.
+- Large inputs may now choose streaming at the default 4 GiB setting,
+  especially with 128-bit keys. This reduces peak memory at the cost of more
+  construction time; total process memory can still exceed the setting.
+
+Dependencies:
+
+- Update the lockfile from yanked `chacha20` 0.10.1 to 0.10.2, which fixes
+  use of an SSE4.1 instruction in its SSE2 backend.
+
+Compatibility and validation:
+
+- Public API compatibility, output formats and unitig IDs are preserved
+  relative to 0.6.0. No index-format migration is required.
+- Add regression coverage for cached lengths, sequence and chunk boundaries,
+  placeholders, multiple files, and memory-policy thresholds.
+- Validate graph and downstream index parity on GENCODE v50, and mapping
+  parity with piscem's strict and permissive skipping strategies. On the
+  reviewed Apple M5 Max workload, the final changes reduce full Salmon index
+  construction from 8.045 to 7.160 seconds relative to #4+#6 (four measured
+  rounds, warm input); process peak RSS is similar. Detailed comparisons and
+  adverse-workload results are recorded in the reviews of #4–#7.
+
 ## 0.6.0 — 2026-10-30
 
 Behavior change (output):
