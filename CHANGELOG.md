@@ -4,11 +4,12 @@
 
 Performance:
 
-- On Linux, read the current RSS that each pipeline phase logs from
-  `/proc/self/statm` instead of spawning `ps`. On a busy many-core host each
-  `ps` took about 0.45 s, so every run, however small its input, spent seconds
-  just logging RSS; salmon's index build on a 12-transcript input went from
-  4.5 s to 0.4 s there. Other platforms still use `ps`. Output is unchanged.
+- Read the current RSS that each pipeline phase logs straight from the kernel
+  (`/proc/self/statm` on Linux, `proc_pidinfo` on macOS) instead of spawning
+  `ps`. On a busy many-core host each `ps` took about 0.45 s, so every run,
+  however small its input, spent seconds just logging RSS; salmon's index build
+  on a 12-transcript input went from 4.5 s to 0.4 s there. Other platforms log
+  0 for the current RSS. Output is unchanged.
 
 ## 0.6.1 — 2026-11-18
 
