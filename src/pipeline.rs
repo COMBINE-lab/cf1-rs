@@ -47,8 +47,29 @@ fn purge_allocator() {
     }
 }
 
-/// Return current RSS in MB via ps (point-in-time snapshot).
+/// Return current RSS in MB (point-in-time snapshot).
+///
+/// On Linux this reads `/proc/self/statm`. Elsewhere it asks `ps`, which spawns
+/// a process: on a busy Linux host that took ~0.45 s per call, which made
+/// every pipeline run, however small its input, take seconds just to log RSS.
 pub fn current_rss_mb() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        // statm fields are in pages; the second is the resident set.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
+            .map_or(0, |pages| pages * page.max(0) as usize / (1024 * 1024))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        rss_mb_from_ps()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rss_mb_from_ps() -> usize {
     let pid = std::process::id();
     std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -150,4 +171,37 @@ where
 
     info!("Pipeline complete.");
     Ok((meta, short_seqs, untiled_seqs))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::current_rss_mb;
+
+    /// The `/proc/self/statm` reading (pages × page size) agrees with the
+    /// kernel's own `VmRSS` (what `ps` reports). The two are read back to back:
+    /// other tests in this process allocate concurrently, so a slow reference
+    /// such as spawning `ps` would race them.
+    #[test]
+    fn current_rss_matches_vmrss() {
+        // Touch some memory so the resident set is well above rounding noise.
+        let mut buf = vec![0u8; 64 << 20];
+        for i in (0..buf.len()).step_by(4096) {
+            buf[i] = 1;
+        }
+        let buf = std::hint::black_box(buf);
+        let ours = current_rss_mb();
+        let vmrss_mb = std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.split_whitespace().next()?.parse::<usize>().ok())
+            .unwrap()
+            / 1024;
+        assert!(ours >= 64, "RSS {ours} MB with a 64 MB buffer resident");
+        assert!(
+            ours.abs_diff(vmrss_mb) <= 8,
+            "statm {ours} MB vs VmRSS {vmrss_mb} MB"
+        );
+        drop(buf);
+    }
 }
