@@ -47,17 +47,51 @@ fn purge_allocator() {
     }
 }
 
-/// Return current RSS in MB via ps (point-in-time snapshot).
+/// Return current RSS in MB (point-in-time snapshot), or 0 where it is not
+/// available.
+///
+/// Read straight from the kernel: `/proc/self/statm` on Linux, `proc_pidinfo`
+/// on macOS (the resident size `ps` reports, without spawning it). Spawning
+/// `ps` took ~0.45 s per call on a busy host, which made every pipeline run,
+/// however small its input, take seconds just to log RSS.
 pub fn current_rss_mb() -> usize {
-    let pid = std::process::id();
-    std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
+    current_rss_bytes() / (1024 * 1024)
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> usize {
+    // statm fields are in pages; the second is the resident set.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    std::fs::read_to_string("/proc/self/statm")
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(0)
-        / 1024
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
+        .map_or(0, |pages| pages * page.max(0) as usize)
+}
+
+#[cfg(target_os = "macos")]
+fn current_rss_bytes() -> usize {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // Returns the bytes written: anything short of the whole struct is a failure.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if n == size {
+        info.pti_resident_size as usize
+    } else {
+        0
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_rss_bytes() -> usize {
+    0
 }
 
 /// Output of [`run_pipeline`]: the unitig/tiling metadata, plus two `(name, length)`
@@ -150,4 +184,54 @@ where
 
     info!("Pipeline complete.");
     Ok((meta, short_seqs, untiled_seqs))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::{current_rss_mb, peak_rss_mb};
+
+    /// Touch `mb` MB so the resident set is well above rounding noise.
+    fn resident_buffer(mb: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; mb << 20];
+        for i in (0..buf.len()).step_by(4096) {
+            buf[i] = 1;
+        }
+        std::hint::black_box(buf)
+    }
+
+    /// The `/proc/self/statm` reading (pages × page size) agrees with the
+    /// kernel's own `VmRSS` (what `ps` reports). The two are read back to back:
+    /// other tests in this process allocate concurrently, so a slow reference
+    /// such as spawning `ps` would race them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_rss_matches_vmrss() {
+        let buf = resident_buffer(64);
+        let ours = current_rss_mb();
+        let vmrss_mb = std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.split_whitespace().next()?.parse::<usize>().ok())
+            .unwrap()
+            / 1024;
+        assert!(ours >= 64, "RSS {ours} MB with a 64 MB buffer resident");
+        assert!(
+            ours.abs_diff(vmrss_mb) <= 8,
+            "statm {ours} MB vs VmRSS {vmrss_mb} MB"
+        );
+        drop(buf);
+    }
+
+    /// The current resident size counts a freshly touched buffer and never
+    /// exceeds the high-water mark `getrusage` reports, read just after it.
+    #[test]
+    fn current_rss_counts_resident_memory_and_stays_below_peak() {
+        let buf = resident_buffer(64);
+        let ours = current_rss_mb();
+        let peak = peak_rss_mb();
+        assert!(ours >= 64, "RSS {ours} MB with a 64 MB buffer resident");
+        assert!(ours <= peak + 1, "current {ours} MB above peak {peak} MB");
+        drop(buf);
+    }
 }
