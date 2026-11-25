@@ -200,27 +200,35 @@ mod tests {
     }
 
     /// The `/proc/self/statm` reading (pages × page size) agrees with the
-    /// kernel's own `VmRSS` (what `ps` reports). The two are read back to back:
-    /// other tests in this process allocate concurrently, so a slow reference
-    /// such as spawning `ps` would race them.
+    /// kernel's own `VmRSS` (what `ps` reports). The two are read back to back,
+    /// but other tests in this process allocate and free concurrently and can
+    /// move the resident set between the reads, so a few attempts are allowed:
+    /// a real disagreement (wrong units, wrong field) fails every one of them.
     #[cfg(target_os = "linux")]
     #[test]
     fn current_rss_matches_vmrss() {
+        let vmrss_mb = || {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("VmRSS:"))
+                .and_then(|v| v.split_whitespace().next()?.parse::<usize>().ok())
+                .unwrap()
+                / 1024
+        };
         let buf = resident_buffer(64);
-        let ours = current_rss_mb();
-        let vmrss_mb = std::fs::read_to_string("/proc/self/status")
-            .unwrap()
-            .lines()
-            .find_map(|l| l.strip_prefix("VmRSS:"))
-            .and_then(|v| v.split_whitespace().next()?.parse::<usize>().ok())
-            .unwrap()
-            / 1024;
-        assert!(ours >= 64, "RSS {ours} MB with a 64 MB buffer resident");
-        assert!(
-            ours.abs_diff(vmrss_mb) <= 8,
-            "statm {ours} MB vs VmRSS {vmrss_mb} MB"
-        );
-        drop(buf);
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let (ours, theirs) = (current_rss_mb(), vmrss_mb());
+            assert!(ours >= 64, "RSS {ours} MB with a 64 MB buffer resident");
+            if ours.abs_diff(theirs) <= 8 {
+                drop(buf);
+                return;
+            }
+            seen.push((ours, theirs));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("statm vs VmRSS (MB) never within 8 MB: {seen:?}");
     }
 
     /// The current resident size counts a freshly touched buffer and never
